@@ -1,0 +1,211 @@
+[gd_scene format=3 uid="uid://bffqttxeuxjtn"]
+
+[ext_resource type="Script" uid="uid://btdpq6uiep12f" path="res://examples/collect3d/collect3d.gd" id="1"]
+
+[sub_resource type="BoxShape3D" id="BoxShape3D_qhg0p"]
+size = Vector3(20, 0.2, 20)
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_h3iqv"]
+albedo_color = Color(0.25, 0.25, 0.3, 1)
+
+[sub_resource type="PlaneMesh" id="PlaneMesh_i71dd"]
+size = Vector2(20, 20)
+
+[sub_resource type="SphereShape3D" id="SphereShape3D_2xca4"]
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_0onl6"]
+albedo_color = Color(0.2, 0.9, 0.3, 1)
+
+[sub_resource type="SphereMesh" id="SphereMesh_yqr7s"]
+
+[sub_resource type="SphereShape3D" id="SphereShape3D_q4j2o"]
+radius = 0.6
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_4q22j"]
+albedo_color = Color(1, 0.85, 0.1, 1)
+
+[sub_resource type="SphereMesh" id="SphereMesh_si7sq"]
+
+[sub_resource type="SphereShape3D" id="SphereShape3D_823gn"]
+radius = 0.6
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_yphcp"]
+albedo_color = Color(1, 0.85, 0.1, 1)
+
+[sub_resource type="SphereMesh" id="SphereMesh_4ne7g"]
+
+[sub_resource type="SphereShape3D" id="SphereShape3D_7bkpv"]
+radius = 0.6
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_gd873"]
+albedo_color = Color(1, 0.85, 0.1, 1)
+
+[sub_resource type="SphereMesh" id="SphereMesh_gy4hd"]
+
+[sub_resource type="SphereShape3D" id="SphereShape3D_ug0qi"]
+radius = 0.6
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_wdkij"]
+albedo_color = Color(1, 0.85, 0.1, 1)
+
+[sub_resource type="SphereMesh" id="SphereMesh_ryn4l"]
+
+[sub_resource type="SphereShape3D" id="SphereShape3D_6wyes"]
+radius = 0.6
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_rl5xc"]
+albedo_color = Color(1, 0.85, 0.1, 1)
+
+[sub_resource type="SphereMesh" id="SphereMesh_m6cc2"]
+
+[sub_resource type="SphereShape3D" id="SphereShape3D_ytkgj"]
+radius = 0.6
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_xedlt"]
+albedo_color = Color(1, 0.85, 0.1, 1)
+
+[sub_resource type="SphereMesh" id="SphereMesh_kxteb"]
+
+[sub_resource type="SphereShape3D" id="SphereShape3D_n3vkk"]
+radius = 0.6
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_1rba5"]
+albedo_color = Color(1, 0.85, 0.1, 1)
+
+[sub_resource type="SphereMesh" id="SphereMesh_tni05"]
+
+[sub_resource type="SphereShape3D" id="SphereShape3D_g2c1e"]
+radius = 0.6
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_anpaf"]
+albedo_color = Color(1, 0.85, 0.1, 1)
+
+[sub_resource type="SphereMesh" id="SphereMesh_d5c31"]
+
+[node name="Collect3D" type="Node3D" unique_id=1808101615]
+script = ExtResource("1")
+
+[node name="Ground" type="StaticBody3D" parent="." unique_id=1806873633]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.1, 0)
+
+[node name="Shape" type="CollisionShape3D" parent="Ground" unique_id=34324983]
+shape = SubResource("BoxShape3D_qhg0p")
+
+[node name="Skin" type="MeshInstance3D" parent="Ground" unique_id=1802334316]
+material_override = SubResource("StandardMaterial3D_h3iqv")
+mesh = SubResource("PlaneMesh_i71dd")
+
+[node name="Player" type="CharacterBody3D" parent="." unique_id=453330226]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.5, 0)
+
+[node name="Body" type="CollisionShape3D" parent="Player" unique_id=1270967380]
+shape = SubResource("SphereShape3D_2xca4")
+
+[node name="Skin" type="MeshInstance3D" parent="Player" unique_id=1330301258]
+material_override = SubResource("StandardMaterial3D_0onl6")
+mesh = SubResource("SphereMesh_yqr7s")
+
+[node name="Orb_0" type="Area3D" parent="." unique_id=519788804]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 5, 0.5, 0)
+
+[node name="Shape" type="CollisionShape3D" parent="Orb_0" unique_id=1909063738]
+shape = SubResource("SphereShape3D_q4j2o")
+
+[node name="Skin" type="MeshInstance3D" parent="Orb_0" unique_id=64500208]
+material_override = SubResource("StandardMaterial3D_4q22j")
+mesh = SubResource("SphereMesh_si7sq")
+
+[node name="Orb_1" type="Area3D" parent="." unique_id=381076159]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 3.535534, 0.5, 3.535534)
+
+[node name="Shape" type="CollisionShape3D" parent="Orb_1" unique_id=2020312701]
+shape = SubResource("SphereShape3D_823gn")
+
+[node name="Skin" type="MeshInstance3D" parent="Orb_1" unique_id=1078061946]
+material_override = SubResource("StandardMaterial3D_yphcp")
+mesh = SubResource("SphereMesh_4ne7g")
+
+[node name="Orb_2" type="Area3D" parent="." unique_id=2093105473]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 3.061617e-16, 0.5, 5)
+
+[node name="Shape" type="CollisionShape3D" parent="Orb_2" unique_id=1308392688]
+shape = SubResource("SphereShape3D_7bkpv")
+
+[node name="Skin" type="MeshInstance3D" parent="Orb_2" unique_id=392535135]
+material_override = SubResource("StandardMaterial3D_gd873")
+mesh = SubResource("SphereMesh_gy4hd")
+
+[node name="Orb_3" type="Area3D" parent="." unique_id=1728396498]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -3.535534, 0.5, 3.535534)
+
+[node name="Shape" type="CollisionShape3D" parent="Orb_3" unique_id=1558069083]
+shape = SubResource("SphereShape3D_ug0qi")
+
+[node name="Skin" type="MeshInstance3D" parent="Orb_3" unique_id=1739828889]
+material_override = SubResource("StandardMaterial3D_wdkij")
+mesh = SubResource("SphereMesh_ryn4l")
+
+[node name="Orb_4" type="Area3D" parent="." unique_id=278978124]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -5, 0.5, 6.123234e-16)
+
+[node name="Shape" type="CollisionShape3D" parent="Orb_4" unique_id=2051711461]
+shape = SubResource("SphereShape3D_6wyes")
+
+[node name="Skin" type="MeshInstance3D" parent="Orb_4" unique_id=126264825]
+material_override = SubResource("StandardMaterial3D_rl5xc")
+mesh = SubResource("SphereMesh_m6cc2")
+
+[node name="Orb_5" type="Area3D" parent="." unique_id=1764568569]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -3.535534, 0.5, -3.535534)
+
+[node name="Shape" type="CollisionShape3D" parent="Orb_5" unique_id=110325625]
+shape = SubResource("SphereShape3D_ytkgj")
+
+[node name="Skin" type="MeshInstance3D" parent="Orb_5" unique_id=1933460589]
+material_override = SubResource("StandardMaterial3D_xedlt")
+mesh = SubResource("SphereMesh_kxteb")
+
+[node name="Orb_6" type="Area3D" parent="." unique_id=1075556605]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -9.18485e-16, 0.5, -5)
+
+[node name="Shape" type="CollisionShape3D" parent="Orb_6" unique_id=310790895]
+shape = SubResource("SphereShape3D_n3vkk")
+
+[node name="Skin" type="MeshInstance3D" parent="Orb_6" unique_id=233093596]
+material_override = SubResource("StandardMaterial3D_1rba5")
+mesh = SubResource("SphereMesh_tni05")
+
+[node name="Orb_7" type="Area3D" parent="." unique_id=1453200042]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 3.535534, 0.5, -3.535534)
+
+[node name="Shape" type="CollisionShape3D" parent="Orb_7" unique_id=101490966]
+shape = SubResource("SphereShape3D_g2c1e")
+
+[node name="Skin" type="MeshInstance3D" parent="Orb_7" unique_id=864464387]
+material_override = SubResource("StandardMaterial3D_anpaf")
+mesh = SubResource("SphereMesh_d5c31")
+
+[node name="Sun" type="DirectionalLight3D" parent="." unique_id=304426273]
+transform = Transform3D(0.921061, -0.30504188, 0.24206632, 0, 0.62161, 0.7833269, -0.38941833, -0.7214919, 0.5725407, 0, 0, 0)
+shadow_enabled = true
+
+[node name="Camera3D" type="Camera3D" parent="." unique_id=1883020031]
+transform = Transform3D(1, 0, 0, 0, 0.8221922, 0.56921, 0, -0.56921, 0.8221922, 0, 9, 13)
+
+[node name="HudLayer" type="CanvasLayer" parent="." unique_id=709645831]
+
+[node name="Hud" type="Label" parent="HudLayer" unique_id=945220818]
+offset_left = 16.0
+offset_top = 12.0
+offset_right = 16.0
+offset_bottom = 12.0
+text = "Orbs: 0"
+
+[connection signal="body_entered" from="Orb_0" to="." method="_on_orb_body_entered" binds= ["Orb_0"]]
+[connection signal="body_entered" from="Orb_1" to="." method="_on_orb_body_entered" binds= ["Orb_1"]]
+[connection signal="body_entered" from="Orb_2" to="." method="_on_orb_body_entered" binds= ["Orb_2"]]
+[connection signal="body_entered" from="Orb_3" to="." method="_on_orb_body_entered" binds= ["Orb_3"]]
+[connection signal="body_entered" from="Orb_4" to="." method="_on_orb_body_entered" binds= ["Orb_4"]]
+[connection signal="body_entered" from="Orb_5" to="." method="_on_orb_body_entered" binds= ["Orb_5"]]
+[connection signal="body_entered" from="Orb_6" to="." method="_on_orb_body_entered" binds= ["Orb_6"]]
+[connection signal="body_entered" from="Orb_7" to="." method="_on_orb_body_entered" binds= ["Orb_7"]]

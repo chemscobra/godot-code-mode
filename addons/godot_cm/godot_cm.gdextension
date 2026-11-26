@@ -1,0 +1,14 @@
+[configuration]
+
+entry_symbol = "godot_cm_library_init"
+compatibility_minimum = "4.7"
+reloadable = true
+
+[libraries]
+
+linux.debug.editor.x86_64 = "res://addons/godot_cm/bin/libgodot_cm.linux.editor.x86_64.so"
+linux.release.editor.x86_64 = "res://addons/godot_cm/bin/libgodot_cm.linux.editor.x86_64.so"
+windows.debug.editor.x86_64 = "res://addons/godot_cm/bin/godot_cm.windows.editor.x86_64.dll"
+windows.release.editor.x86_64 = "res://addons/godot_cm/bin/godot_cm.windows.editor.x86_64.dll"
+macos.debug.editor = "res://addons/godot_cm/bin/libgodot_cm.macos.editor.framework/libgodot_cm.macos.editor"
+macos.release.editor = "res://addons/godot_cm/bin/libgodot_cm.macos.editor.framework/libgodot_cm.macos.editor"

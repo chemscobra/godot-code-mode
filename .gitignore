@@ -1,0 +1,18 @@
+# CMake build trees — local artifacts only, never shipped
+build/
+build-release/
+build-windows/
+build-windows-release/
+
+# Godot editor cache in the demo project
+godot-cm/.godot/
+
+# Session tokens must never be committed
+**/godot_cm_session
+
+# Crash dumps
+core
+*.core
+
+# Working docs not meant for the repo
+godot-codemode-openspec.pdf

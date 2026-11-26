@@ -1,0 +1,45 @@
+[gd_scene format=3 uid="uid://godotcmtest1"]
+
+[node name="TestRoot" type="Node3D" unique_id=81759569]
+
+[node name="TxTest" type="MeshInstance3D" parent="." unique_id=1426043132]
+
+[node name="Bench_0" type="MeshInstance3D" parent="." unique_id=908676302]
+
+[node name="Bench_1" type="MeshInstance3D" parent="." unique_id=967011634]
+
+[node name="Bench_2" type="MeshInstance3D" parent="." unique_id=990227054]
+
+[node name="Bench_3" type="MeshInstance3D" parent="." unique_id=89826428]
+
+[node name="Bench_4" type="MeshInstance3D" parent="." unique_id=1078870610]
+
+[node name="Bench_5" type="MeshInstance3D" parent="." unique_id=67817595]
+
+[node name="Bench_6" type="MeshInstance3D" parent="." unique_id=1824775257]
+
+[node name="Bench_7" type="MeshInstance3D" parent="." unique_id=1900661068]
+
+[node name="Bench_8" type="MeshInstance3D" parent="." unique_id=1583686034]
+
+[node name="Bench_9" type="MeshInstance3D" parent="." unique_id=687220288]
+
+[node name="Bench_10" type="MeshInstance3D" parent="." unique_id=1280802036]
+
+[node name="Bench_11" type="MeshInstance3D" parent="." unique_id=165161621]
+
+[node name="Bench_12" type="MeshInstance3D" parent="." unique_id=1392601870]
+
+[node name="Bench_13" type="MeshInstance3D" parent="." unique_id=2053996055]
+
+[node name="Bench_14" type="MeshInstance3D" parent="." unique_id=1306921964]
+
+[node name="Bench_15" type="MeshInstance3D" parent="." unique_id=1318735769]
+
+[node name="Bench_16" type="MeshInstance3D" parent="." unique_id=307992373]
+
+[node name="Bench_17" type="MeshInstance3D" parent="." unique_id=1458287911]
+
+[node name="Bench_18" type="MeshInstance3D" parent="." unique_id=589857338]
+
+[node name="Bench_19" type="MeshInstance3D" parent="." unique_id=484664714]
