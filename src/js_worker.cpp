@@ -17,6 +17,7 @@
 
 #include "api_index.hpp"
 #include "bridge.hpp"
+#include "value_codec.hpp"
 
 extern "C" {
 #include <quickjs.h>
@@ -57,6 +58,7 @@ Dictionary base_result(bool ok) {
 	d["result"] = Variant();
 	d["diagnostics"] = Array();
 	d["changes"] = Array();
+	d["checkpoints"] = Array();
 	d["truncated"] = false;
 	return d;
 }
@@ -73,17 +75,61 @@ Dictionary error_result(const String &code, const String &message, const String 
 	return d;
 }
 
+Dictionary bounded_response(Dictionary out) {
+	for (const char *field : {"diagnostics", "effects", "changes"}) {
+		Array records = Array(out.get(field, Array())).duplicate();
+		for (int i = 0; i < records.size(); i++) {
+			if (records[i].get_type() != Variant::DICTIONARY) continue;
+			Dictionary record = Dictionary(records[i]).duplicate(true);
+			int64_t omitted = 0;
+			for (const Variant &key : record.keys()) {
+				if (record[key].get_type() != Variant::STRING) continue;
+				String text = record[key];
+				if (text.length() <= 512) continue;
+				omitted += text.length() - 512;
+				record[key] = text.substr(0, 512);
+			}
+			if (omitted) { record["omitted_characters"] = omitted; out["truncated"] = true; }
+			records[i] = record;
+		}
+		out[field] = records;
+	}
+	auto fits = [&]() { return JSON::stringify(out).utf8().length() <= OUTPUT_LIMIT; };
+	if (fits()) return out;
+	out["truncated"] = true;
+	if (out.get("result", Variant()).get_type() != Variant::NIL) {
+		out["result"] = Variant();
+		out["result_omitted"] = true;
+	}
+	for (const char *field : {"effects", "changes", "diagnostics"}) {
+		if (fits()) break;
+		Array records = out.get(field, Array());
+		int minimum = String(field) == "diagnostics" && !records.is_empty() ? 1 : 0;
+		int low = minimum, high = records.size();
+		String omitted_field = String(field) + "_omitted";
+		while (low < high) {
+			int middle = (low + high + 1) / 2;
+			out[field] = records.slice(0, middle);
+			out[omitted_field] = records.size() - middle;
+			if (fits()) low = middle; else high = middle - 1;
+		}
+		out[field] = records.slice(0, low);
+		out[omitted_field] = records.size() - low;
+	}
+	return out;
+}
+
 // Variant -> JSValue for api.* return values (metadata surface only).
 JSValue variant_to_js(JSContext *ctx, const Variant &v) {
 	switch (v.get_type()) {
 		case Variant::NIL:
-			return JS_UNDEFINED;
+			return JS_NULL;
 		case Variant::BOOL:
 			return JS_NewBool(ctx, (bool)v);
 		case Variant::INT:
-			return JS_NewInt64(ctx, (int64_t)v);
+			return (int64_t)v < -ValueCodec::SAFE_INTEGER || (int64_t)v > ValueCodec::SAFE_INTEGER ? variant_to_js(ctx, ValueCodec().encode(v)) : JS_NewInt64(ctx, (int64_t)v);
 		case Variant::FLOAT:
-			return JS_NewFloat64(ctx, (double)v);
+			return !std::isfinite((double)v) || ((double)v == 0 && std::signbit((double)v)) ? variant_to_js(ctx, ValueCodec().encode(v)) : JS_NewFloat64(ctx, (double)v);
 		case Variant::STRING:
 		case Variant::STRING_NAME: {
 			CharString s = String(v).utf8();
@@ -104,7 +150,9 @@ JSValue variant_to_js(JSContext *ctx, const Variant &v) {
 			for (int i = 0; i < keys.size(); i++) {
 				String k = String(keys[i]);
 				CharString ks = k.utf8();
-				JS_SetPropertyStr(ctx, obj, ks.get_data(), variant_to_js(ctx, d[keys[i]]));
+				JSAtom key = JS_NewAtomLen(ctx, ks.get_data(), ks.length());
+				JS_DefinePropertyValue(ctx, obj, key, variant_to_js(ctx, d[keys[i]]), JS_PROP_C_W_E);
+				JS_FreeAtom(ctx, key);
 			}
 			return obj;
 		}
@@ -123,6 +171,19 @@ ExecCtx *exec_ctx(JSContext *ctx) {
 
 const ApiCatalog *ctx_index(JSContext *ctx);
 
+const char *identifier_string(JSContext *ctx, JSValueConst value);
+
+JSValue js_api_types(JSContext *ctx, JSValueConst, int, JSValueConst *) { return variant_to_js(ctx, ValueCodec::types()); }
+
+JSValue js_api_describe_type(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
+	if (argc < 1 || !JS_IsString(argv[0])) return JS_ThrowTypeError(ctx, "api.describeType(name) requires a string");
+	const char *text = identifier_string(ctx, argv[0]);
+	String name = text ? String::utf8(text) : String();
+	if (text) JS_FreeCString(ctx, text);
+	Dictionary info = ValueCodec::describe_type(name);
+	return info.is_empty() ? JS_UNDEFINED : variant_to_js(ctx, info);
+}
+
 JSValue js_api_classes(JSContext *ctx, JSValueConst, int, JSValueConst *) {
 	const ApiCatalog *idx = ctx_index(ctx);
 	if (!idx) {
@@ -133,23 +194,23 @@ JSValue js_api_classes(JSContext *ctx, JSValueConst, int, JSValueConst *) {
 
 JSValue js_api_describe(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
 	const ApiCatalog *idx = ctx_index(ctx);
-	if (!idx || argc < 1) {
+	if (!idx || argc < 1 || !JS_IsString(argv[0])) {
 		return JS_ThrowInternalError(ctx, "api.describe(name) needs an argument");
 	}
-	const char *n = JS_ToCString(ctx, argv[0]);
+	const char *n = identifier_string(ctx, argv[0]);
 	Variant out = idx->describe(String::utf8(n ? n : ""));
 	if (n) {
 		JS_FreeCString(ctx, n);
 	}
-	return variant_to_js(ctx, out);
+	return out.get_type() == Variant::NIL ? JS_UNDEFINED : variant_to_js(ctx, out);
 }
 
 JSValue js_api_find(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
 	const ApiCatalog *idx = ctx_index(ctx);
-	if (!idx || argc < 1) {
+	if (!idx || argc < 1 || !JS_IsString(argv[0])) {
 		return JS_ThrowInternalError(ctx, "api.find(query) needs an argument");
 	}
-	const char *n = JS_ToCString(ctx, argv[0]);
+	const char *n = identifier_string(ctx, argv[0]);
 	Array out = idx->find(String::utf8(n ? n : ""));
 	if (n) {
 		JS_FreeCString(ctx, n);
@@ -165,6 +226,12 @@ struct InflightOp {
 	std::shared_ptr<PendingBridge> pb;
 	JSValue resolve;
 	JSValue reject;
+	Dictionary source;
+};
+
+struct KnownError {
+	JSValue value;
+	Dictionary diagnostic;
 };
 
 struct ExecCtx {
@@ -176,6 +243,18 @@ struct ExecCtx {
 	std::shared_ptr<TxState> tx;
 	std::deque<InflightOp> inflight;
 	bool native_pending = false;
+	JSValue object_prototype = JS_UNDEFINED;
+	JSClassID object_class = 0;
+	JSValue error_constructor = JS_UNDEFINED;
+	JSValue error_stack_getter = JS_UNDEFINED;
+	JSValue prepare_getter = JS_UNDEFINED;
+	JSValue prepare_setter = JS_UNDEFINED;
+	JSValue stack_limit_getter = JS_UNDEFINED;
+	godot::Dictionary encoding_error;
+	std::vector<KnownError> known_errors;
+	int source_lines = 1;
+	godot::Array checkpoints;
+	size_t checkpoint_bytes = 2;
 	godot::Array warnings; // non-fatal op warnings folded into diagnostics
 };
 
@@ -188,63 +267,236 @@ Variant unwrap_tagged(const Variant &p);
 
 // JSValue -> Variant. {__godotHandle:"hN"} -> {"$handle":N} for the bridge;
 // {$t:"Vector2/3/Color",...} -> tagged engine types; objects via JSON round-trip.
-Variant js_to_variant(JSContext *ctx, JSValueConst v) {
-	int tag = JS_VALUE_GET_TAG(v);
-	switch (tag) {
-		case JS_TAG_UNDEFINED:
-		case JS_TAG_NULL:
-			return Variant();
-		case JS_TAG_BOOL:
-			return Variant((bool)JS_VALUE_GET_BOOL(v));
-		case JS_TAG_INT:
-			return Variant((int64_t)JS_VALUE_GET_INT(v));
-		case JS_TAG_FLOAT64:
-			return Variant(JS_VALUE_GET_FLOAT64(v));
-		case JS_TAG_STRING: {
-			const char *s = JS_ToCString(ctx, v);
-			String out = s ? String::utf8(s) : String();
-			if (s) {
-				JS_FreeCString(ctx, s);
-			}
-			return out;
-		}
-		default:
-			break;
-	}
-	// Objects/arrays: check handle marker first.
-	JSValue hprop = JS_GetPropertyStr(ctx, v, "__godotHandle");
-	if (JS_IsString(hprop)) {
-		const char *s = JS_ToCString(ctx, hprop);
-		String hs = s ? String::utf8(s) : String();
-		if (s) {
-			JS_FreeCString(ctx, s);
-		}
-		JS_FreeValue(ctx, hprop);
-		Dictionary d;
-		if (hs.begins_with("h")) {
-			d["$handle"] = (uint64_t)hs.substr(1).to_int();
-		}
-		return d;
-	}
-	JS_FreeValue(ctx, hprop);
+struct OwnedJs {
+	JSContext *ctx;
+	JSValue value;
+	~OwnedJs() { JS_FreeValue(ctx, value); }
+};
 
-	JSValue json = JS_JSONStringify(ctx, v, JS_UNDEFINED, JS_UNDEFINED);
-	const char *s = JS_ToCString(ctx, json);
-	String text = s ? String::utf8(s) : String();
-	if (s) {
-		JS_FreeCString(ctx, s);
+struct OwnDescriptor {
+	JSContext *ctx;
+	JSPropertyDescriptor value{0, JS_UNDEFINED, JS_UNDEFINED, JS_UNDEFINED};
+	~OwnDescriptor() { JS_FreeValue(ctx, value.value); JS_FreeValue(ctx, value.getter); JS_FreeValue(ctx, value.setter); }
+};
+
+struct DataBudget {
+	std::vector<JSValueConst> ancestors;
+	size_t bytes = 0;
+	int nodes = 0;
+};
+
+String primitive_string(JSContext *ctx, JSValueConst value, String path = "value") {
+	size_t length = 0;
+	const char *text = JS_ToCStringLen(ctx, &length, value);
+	if (!text) ValueCodec::fail("INVALID_VALUE_ENCODING", "unable to read primitive string");
+	String result = String::utf8(text, (int)length);
+	JS_FreeCString(ctx, text);
+	if (JS_IsString(value)) {
+		CharString encoded = result.utf8();
+		OwnedJs round_trip{ctx, JS_NewStringLen(ctx, encoded.get_data(), encoded.length())};
+		if (!JS_IsStrictEqual(ctx, value, round_trip.value)) ValueCodec::fail("INVALID_VALUE_ENCODING", "string cannot be represented by Godot without data loss", path);
 	}
-	JS_FreeValue(ctx, json);
-	if (text.is_empty()) {
-		return Variant();
+	return result;
+}
+
+Variant passive_data(JSContext *ctx, JSValueConst value, DataBudget &budget, String path, int depth = 0, bool allow_void = false) {
+	if (depth > ValueCodec::MAX_DEPTH || ++budget.nodes > 100000 || (budget.bytes += 16) > HEAP_LIMIT) ValueCodec::fail("VALUE_DEPTH_LIMIT", "data depth, count or byte budget exceeded", path);
+	if (JS_IsUndefined(value)) {
+		if (allow_void) return Variant();
+		ValueCodec::fail("INVALID_VALUE_ENCODING", "undefined is not transportable data", path);
 	}
-	Ref<JSON> j;
-	j.instantiate();
-	if (j->parse(text) != OK) {
-		return Variant();
+	if (JS_IsNull(value)) return Variant();
+	if (JS_IsBool(value)) return (bool)JS_VALUE_GET_BOOL(value);
+	if (JS_IsBigInt(value)) {
+		String text = primitive_string(ctx, value, path);
+		ValueCodec::integer_text(text, path);
+		Dictionary tagged; tagged["$t"] = "int"; tagged["value"] = text;
+		return tagged;
 	}
-	Variant parsed = j->get_data();
-	return unwrap_tagged(parsed);
+	if (JS_IsNumber(value)) {
+		if (JS_VALUE_GET_TAG(value) == JS_TAG_INT) return (int64_t)JS_VALUE_GET_INT(value);
+		return ValueCodec().encode(JS_VALUE_GET_FLOAT64(value), path);
+	}
+	if (JS_IsString(value)) {
+		String text = primitive_string(ctx, value, path);
+		budget.bytes += text.utf8().length();
+		if (budget.bytes > HEAP_LIMIT) ValueCodec::fail("OUTPUT_LIMIT", "data byte budget exceeded", path);
+		return text;
+	}
+	if (!JS_IsObject(value) || JS_IsProxy(value) || JS_IsFunction(ctx, value)) ValueCodec::fail("INVALID_VALUE_ENCODING", "only passive data is transportable", path);
+	if (JS_IsPromise(value)) ValueCodec::fail("UNAWAITED_VALUE", "nested promise must be awaited", path);
+	bool array = JS_IsArray(value);
+	ExecCtx *ec = exec_ctx(ctx);
+	if (!array) {
+		if (!ec || JS_GetClassID(value) != ec->object_class) ValueCodec::fail("INVALID_VALUE_ENCODING", "unsupported object class", path);
+		OwnedJs prototype{ctx, JS_GetPrototype(ctx, value)};
+		if (!JS_IsNull(prototype.value) && !JS_IsStrictEqual(ctx, prototype.value, ec->object_prototype)) ValueCodec::fail("INVALID_VALUE_ENCODING", "expected plain data object", path);
+	}
+	for (JSValueConst ancestor : budget.ancestors) if (JS_IsStrictEqual(ctx, value, ancestor)) ValueCodec::fail("INVALID_VALUE_ENCODING", "cyclic data", path);
+	budget.ancestors.push_back(value);
+	struct Pop { std::vector<JSValueConst> &values; ~Pop() { values.pop_back(); } } pop{budget.ancestors};
+	JSPropertyEnum *properties = nullptr;
+	uint32_t count = 0;
+	if (JS_GetOwnPropertyNames(ctx, &properties, &count, value, JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK | JS_GPN_SET_ENUM) < 0) ValueCodec::fail("INVALID_VALUE_ENCODING", "unable to inspect own data properties", path);
+	struct FreeProperties { JSContext *ctx; JSPropertyEnum *data; uint32_t size; ~FreeProperties() { JS_FreePropertyEnum(ctx, data, size); } } free_properties{ctx, properties, count};
+	if (count > 100001) ValueCodec::fail("VALUE_DEPTH_LIMIT", "data property count exceeded", path);
+	Array items;
+	Dictionary record;
+	int64_t length = 0, indices = 0;
+	if (array) {
+		JSAtom atom = JS_NewAtom(ctx, "length");
+		OwnDescriptor own{ctx};
+		int found = JS_GetOwnProperty(ctx, &own.value, value, atom);
+		JS_FreeAtom(ctx, atom);
+		if (found != 1 || (own.value.flags & JS_PROP_TMASK) == JS_PROP_GETSET || !JS_IsNumber(own.value.value) || JS_ToInt64(ctx, &length, own.value.value) < 0 || length < 0 || length > 100000) ValueCodec::fail("INVALID_VALUE_ENCODING", "invalid or oversized array length", path);
+		items.resize(length);
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		OwnedJs key{ctx, JS_AtomToValue(ctx, properties[i].atom)};
+		if (JS_IsSymbol(key.value)) ValueCodec::fail("INVALID_VALUE_ENCODING", "symbol keys are not data", path);
+		String name = primitive_string(ctx, key.value);
+		budget.bytes += name.utf8().length();
+		String child = path + String(".") + name;
+		OwnDescriptor own{ctx};
+		if (JS_GetOwnProperty(ctx, &own.value, value, properties[i].atom) != 1 || (own.value.flags & JS_PROP_TMASK) == JS_PROP_GETSET) ValueCodec::fail("INVALID_VALUE_ENCODING", "accessors are not passive data", child);
+		if (array && name == "length") continue;
+		if (!(own.value.flags & JS_PROP_ENUMERABLE)) ValueCodec::fail("INVALID_VALUE_ENCODING", "non-enumerable data cannot be transported implicitly", child);
+		if (array) {
+			int64_t index = name.to_int();
+			if (index < 0 || index >= length || name != String::num_int64(index)) ValueCodec::fail("INVALID_VALUE_ENCODING", "arrays require indexed elements only", child);
+			items[index] = passive_data(ctx, own.value.value, budget, path + String("[") + itos(index) + String("]"), depth + 1);
+			indices++;
+		} else record[name] = passive_data(ctx, own.value.value, budget, child, depth + 1);
+	}
+	if (array && indices != length) ValueCodec::fail("INVALID_VALUE_ENCODING", "sparse arrays are not transportable", path);
+	return array ? Variant(items) : Variant(record);
+}
+
+Variant js_to_variant(JSContext *ctx, JSValueConst v) {
+	// Objects/arrays: check handle marker first.
+	DataBudget budget;
+	return passive_data(ctx, v, budget, "value");
+}
+
+JSValue passive_json(JSContext *ctx, JSValueConst value) {
+	try {
+		DataBudget budget;
+		Variant data = passive_data(ctx, value, budget, "result", 0, true);
+		String text = JSON::stringify(data);
+		CharString bytes = text.utf8();
+		if (bytes.length() > OUTPUT_LIMIT) ValueCodec::fail("OUTPUT_LIMIT", "encoded result exceeds output budget", "result");
+		return JS_NewStringLen(ctx, bytes.get_data(), bytes.length());
+	} catch (const ValueFailure &failure) {
+		exec_ctx(ctx)->encoding_error = failure.diagnostic;
+		return JS_NewString(ctx, "null");
+	}
+}
+
+JSValue new_passive_error(JSContext *ctx) {
+	ExecCtx *ec = exec_ctx(ctx);
+	if (!ec || JS_IsUndefined(ec->stack_limit_getter)) return JS_NewObject(ctx);
+	OwnedJs limit{ctx, JS_Call(ctx, ec->stack_limit_getter, ec->error_constructor, 0, nullptr)};
+	if (!JS_IsNumber(limit.value)) return JS_NewObject(ctx);
+	OwnedJs prepare{ctx, JS_Call(ctx, ec->prepare_getter, ec->error_constructor, 0, nullptr)};
+	JSValue disabled = JS_UNDEFINED;
+	OwnedJs disabling{ctx, JS_Call(ctx, ec->prepare_setter, ec->error_constructor, 1, &disabled)};
+	JSValue error = JS_NewError(ctx);
+	OwnedJs restoring{ctx, JS_Call(ctx, ec->prepare_setter, ec->error_constructor, 1, &prepare.value)};
+	return error;
+}
+
+JSValue diagnostic_error(JSContext *ctx, const Dictionary &diagnostic) {
+	Dictionary bounded = diagnostic.duplicate(true);
+	int64_t omitted = 0;
+	for (const Variant &key : bounded.keys()) {
+		if (bounded[key].get_type() != Variant::STRING) continue;
+		String text = bounded[key];
+		if (text.length() > 512) { omitted += text.length() - 512; bounded[key] = text.substr(0, 512); }
+	}
+	if (omitted) bounded["omitted_characters"] = omitted;
+	JSValue error = new_passive_error(ctx);
+	for (const Variant &key : bounded.keys()) JS_SetPropertyStr(ctx, error, String(key).utf8().get_data(), variant_to_js(ctx, bounded[key]));
+	ExecCtx *ec = exec_ctx(ctx);
+	if (ec) ec->known_errors.push_back({JS_DupValue(ctx, error), bounded});
+	return error;
+}
+
+String own_error_string(JSContext *ctx, JSValueConst error, const char *field) {
+	if (!JS_IsObject(error) || JS_IsProxy(error)) return String();
+	ExecCtx *ec = exec_ctx(ctx);
+	if (String(field) == "stack" && JS_IsError(error) && ec && !JS_IsUndefined(ec->error_stack_getter)) {
+		OwnedJs stack{ctx, JS_Call(ctx, ec->error_stack_getter, error, 0, nullptr)};
+		if (!JS_IsString(stack.value)) return String();
+		try { return primitive_string(ctx, stack.value); } catch (const ValueFailure &) { return String(); }
+	}
+	JSAtom key = JS_NewAtom(ctx, field);
+	OwnDescriptor own{ctx};
+	int found = JS_GetOwnProperty(ctx, &own.value, error, key);
+	JS_FreeAtom(ctx, key);
+	if (found != 1 || (own.value.flags & JS_PROP_TMASK) == JS_PROP_GETSET || !JS_IsString(own.value.value)) return String();
+	try { return primitive_string(ctx, own.value.value); }
+	catch (const ValueFailure &) { return String(); }
+}
+
+Dictionary source_location(JSContext *ctx, JSValueConst error) {
+	Dictionary source;
+	String normalized;
+	ExecCtx *ec = exec_ctx(ctx);
+	for (String frame : own_error_string(ctx, error, "stack").split("\n")) {
+		int marker = frame.find("<execute>:");
+		if (marker < 0) continue;
+		int start = marker + 10, end = start;
+		while (end < frame.length() && frame[end] >= '0' && frame[end] <= '9') end++;
+		if (end == start) continue;
+		int line = frame.substr(start, end - start).to_int() - 1;
+		if (line < 1 || (ec && line > ec->source_lines)) continue;
+		if (source.is_empty()) {
+			source["line"] = line;
+			int column_start = end + 1, column_end = column_start;
+			if (end < frame.length() && frame[end] == ':') {
+				while (column_end < frame.length() && frame[column_end] >= '0' && frame[column_end] <= '9') column_end++;
+				if (column_end > column_start) source["column"] = frame.substr(column_start, column_end - column_start).to_int();
+			}
+		}
+		if (!normalized.is_empty()) normalized += "\n";
+		normalized += frame.substr(0, start) + itos(line) + frame.substr(end);
+		if (normalized.length() >= 1024) break;
+	}
+	if (!source.is_empty()) source["stack"] = normalized.substr(0, 1024);
+	return source;
+}
+
+Dictionary exception_result(JSContext *ctx, JSValueConst error, const String &fallback) {
+	Dictionary diagnostic;
+	ExecCtx *ec = exec_ctx(ctx);
+	if (ec) for (const KnownError &known : ec->known_errors) {
+		if (JS_IsStrictEqual(ctx, known.value, error)) { diagnostic = known.diagnostic.duplicate(true); break; }
+	}
+	if (diagnostic.is_empty()) {
+		diagnostic["code"] = fallback;
+		diagnostic["phase"] = "execute";
+		String message;
+		if (JS_IsString(error)) { try { message = primitive_string(ctx, error); } catch (const ValueFailure &) {} }
+		else if (JS_IsError(error) && !JS_IsProxy(error)) message = own_error_string(ctx, error, "message");
+		diagnostic["message"] = message.is_empty() ? String("JavaScript execution failed") : message.substr(0, 512);
+	}
+	if (!diagnostic.has("source")) {
+		Dictionary source = source_location(ctx, error);
+		if (!source.is_empty()) diagnostic["source"] = source;
+	}
+	Dictionary result = base_result(false);
+	result["diagnostics"] = Array::make(diagnostic);
+	return result;
+}
+
+template<auto Function>
+JSValue guarded(JSContext *ctx, JSValueConst self, int argc, JSValueConst *argv) {
+	try { return Function(ctx, self, argc, argv); }
+	catch (const ValueFailure &failure) {
+		ExecCtx *ec = exec_ctx(ctx);
+		if (ec && ec->budget) ec->budget->ops.fetch_add(1);
+		return JS_Throw(ctx, diagnostic_error(ctx, failure.diagnostic));
+	}
 }
 
 // Recursively resolves {"$t":...} tagged engine types inside arrays and
@@ -310,7 +562,7 @@ Variant unwrap_tagged(const Variant &p) {
 bool arg_is_write(const char *kind, const char *member) {
 	String k = kind;
 	if (k == "create" || k == "set" || k == "save_scene" || k == "unlock_writes" ||
-			k == "connect" || k == "disconnect") {
+			k == "connect" || k == "disconnect" || k == "value_release") {
 		return true;
 	}
 	if (k == "call") {
@@ -328,10 +580,11 @@ bool arg_is_write(const char *kind, const char *member) {
 }
 
 JSValue reject_value(JSContext *ctx, const BridgeResult &r) {
-	JSValue err = JS_NewError(ctx);
-	JS_SetPropertyStr(ctx, err, "code", JS_NewString(ctx, r.error_code.utf8().get_data()));
-	JS_SetPropertyStr(ctx, err, "message", JS_NewString(ctx, r.error_message.utf8().get_data()));
-	return err;
+	Dictionary diagnostic = r.error_context.duplicate(true);
+	diagnostic["code"] = r.error_code;
+	diagnostic["message"] = r.error_message.substr(0, 512);
+	if (!diagnostic.has("phase")) diagnostic["phase"] = "bridge";
+	return diagnostic_error(ctx, diagnostic);
 }
 
 // Shared submit for all godot.* ops: enqueue -> promise.
@@ -357,7 +610,7 @@ JSValue submit_op(JSContext *ctx, const char *kind, uint64_t target,
 		ec->budget->ops.fetch_add(op_count);
 	}
 	if (op.write && !op.write_mode) {
-		return JS_ThrowInternalError(ctx, "PERMISSION: write op in read mode");
+		ValueCodec::fail("PERMISSION", "write operation requires write or untracked mode");
 	}
 	auto pb = ec->bridge->enqueue(op, ec->cancel, ec->tx);
 
@@ -367,23 +620,66 @@ JSValue submit_op(JSContext *ctx, const char *kind, uint64_t target,
 	io.pb = pb;
 	io.resolve = funcs[0];
 	io.reject = funcs[1];
+	OwnedJs site{ctx, new_passive_error(ctx)};
+	io.source = source_location(ctx, site.value);
 	ec->inflight.push_back(io);
 	return promise;
 }
 
 uint64_t handle_id_of(JSContext *ctx, JSValueConst v) {
 	Variant hv = js_to_variant(ctx, v);
-	if (hv.get_type() == Variant::DICTIONARY && ((Dictionary)hv).has("$handle")) {
-		return (uint64_t)((Dictionary)hv)["$handle"];
+	if (hv.get_type() == Variant::DICTIONARY && ((Dictionary)hv).has("__godotValue")) ValueCodec::fail("REFERENCE_KIND_MISMATCH", "value references are not object targets", "target");
+	if (hv.get_type() == Variant::DICTIONARY && ((Dictionary)hv).has("__godotHandle")) {
+		ExecCtx *ec = exec_ctx(ctx);
+		return ec && ec->bridge ? ec->bridge->handle_id(((Dictionary)hv)["__godotHandle"]) : 0;
 	}
 	return 0;
 }
+
+const char *identifier_string(JSContext *ctx, JSValueConst value) {
+	if (!JS_IsString(value)) ValueCodec::fail("INVALID_VALUE_ENCODING", "member name must be a string", "member");
+	primitive_string(ctx, value, "member");
+	return JS_ToCString(ctx, value);
+}
+
+JSValue js_checkpoint(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
+	if (argc != 2) ValueCodec::fail("BAD_ARGS", "checkpoint(name,value) requires two arguments", "checkpoint");
+	ExecCtx *ec = exec_ctx(ctx);
+	if (!JS_IsString(argv[0]) || ec->checkpoints.size() >= 32) ValueCodec::fail("CHECKPOINT_LIMIT", "checkpoint name or entry limit exceeded", "checkpoint.name");
+	String name = primitive_string(ctx, argv[0], "checkpoint.name");
+	int bytes = name.utf8().length();
+	if (bytes < 1 || bytes > 128) ValueCodec::fail("CHECKPOINT_LIMIT", "checkpoint names require 1..128 UTF-8 bytes", "checkpoint.name");
+	DataBudget budget;
+	Variant data;
+	try { data = passive_data(ctx, argv[1], budget, "checkpoint.value"); }
+	catch (ValueFailure &failure) {
+		if (String(failure.diagnostic.get("code", "")) == "VALUE_DEPTH_LIMIT") failure.diagnostic["code"] = "CHECKPOINT_LIMIT";
+		failure.diagnostic["phase"] = "checkpoint";
+		throw;
+	}
+	Dictionary entry; entry["name"] = name; entry["value"] = data;
+	size_t encoded_bytes = JSON::stringify(entry).utf8().length() + (ec->checkpoints.is_empty() ? 0 : 1);
+	if (encoded_bytes > (64u << 10) - ec->checkpoint_bytes) ValueCodec::fail("CHECKPOINT_LIMIT", "checkpoint byte budget exceeded", "checkpoint.value");
+	ec->checkpoints.push_back(entry);
+	ec->checkpoint_bytes += encoded_bytes;
+	return JS_UNDEFINED;
+}
+
+JSValue value_submit(JSContext *ctx, int argc, JSValueConst *argv, const char *kind, int maximum) {
+	if (argc < 1 || argc > maximum) ValueCodec::fail("BAD_ARGS", "invalid value operation arguments");
+	Array args; for (int i = 0; i < argc; i++) args.push_back(js_to_variant(ctx, argv[i]));
+	return submit_op(ctx, kind, 0, "", args);
+}
+
+JSValue js_value_inspect(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) { return value_submit(ctx, argc, argv, "value_inspect", 1); }
+JSValue js_value_read(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) { return value_submit(ctx, argc, argv, "value_read", 2); }
+JSValue js_value_release(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) { return value_submit(ctx, argc, argv, "value_release", 1); }
 
 JSValue js_godot_create(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
 	if (argc < 1 || !JS_IsString(argv[0])) {
 		return JS_ThrowInternalError(ctx, "godot.create(className)");
 	}
-	const char *s = JS_ToCString(ctx, argv[0]);
+	const char *s = identifier_string(ctx, argv[0]);
 	String cls = s ? String::utf8(s) : String();
 	if (s) {
 		JS_FreeCString(ctx, s);
@@ -395,7 +691,7 @@ JSValue js_godot_create(JSContext *ctx, JSValueConst, int argc, JSValueConst *ar
 
 JSValue js_godot_singleton(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
 	if (argc < 1 || !JS_IsString(argv[0])) return JS_ThrowTypeError(ctx, "godot.getSingleton(className)");
-	const char *name = JS_ToCString(ctx, argv[0]);
+	const char *name = identifier_string(ctx, argv[0]);
 	JSValue result = submit_op(ctx, "singleton", 0, "", Array(), name ? name : "");
 	if (name) JS_FreeCString(ctx, name);
 	return result;
@@ -419,7 +715,7 @@ JSValue js_godot_request_tier(JSContext *ctx, JSValueConst, int argc, JSValueCon
 	if (argc < 1 || !JS_IsString(argv[0])) {
 		return JS_ThrowInternalError(ctx, "godot.requestTier(tier)");
 	}
-	const char *s = JS_ToCString(ctx, argv[0]);
+	const char *s = identifier_string(ctx, argv[0]);
 	String tier = s ? String::utf8(s) : String();
 	if (s) {
 		JS_FreeCString(ctx, s);
@@ -437,18 +733,14 @@ JSValue js_godot_batch(JSContext *ctx, JSValueConst, int argc, JSValueConst *arg
 	if (argc < 1 || !JS_IsArray(argv[0])) {
 		return JS_ThrowInternalError(ctx, "godot.batch(ops[])");
 	}
-	JSValue len_v = JS_GetPropertyStr(ctx, argv[0], "length");
-	int64_t len = 0;
-	JS_ToInt64(ctx, &len, len_v);
-	JS_FreeValue(ctx, len_v);
+	Array decoded = js_to_variant(ctx, argv[0]);
+	int64_t len = decoded.size();
 	if (len > OP_LIMIT) {
 		return JS_ThrowInternalError(ctx, "godot.batch: element count exceeds op budget");
 	}
 	Array elements;
 	for (int64_t i = 0; i < len; i++) {
-		JSValue el = JS_GetPropertyUint32(ctx, argv[0], i);
-		Variant dv = js_to_variant(ctx, el);
-		JS_FreeValue(ctx, el);
+		Variant dv = decoded[i];
 		if (dv.get_type() != Variant::DICTIONARY) {
 			return JS_ThrowInternalError(ctx, "godot.batch: elements must be objects");
 		}
@@ -461,8 +753,8 @@ JSValue js_godot_batch(JSContext *ctx, JSValueConst, int argc, JSValueConst *arg
 		out["class_name"] = d.get("class", d.get("class_name", ""));
 		uint64_t target = 0;
 		Variant tv = d.get("target", Variant());
-		if (tv.get_type() == Variant::DICTIONARY && ((Dictionary)tv).has("$handle")) {
-			target = (uint64_t)((Dictionary)tv)["$handle"];
+		if (tv.get_type() == Variant::DICTIONARY && ((Dictionary)tv).has("__godotHandle")) {
+			target = exec_ctx(ctx)->bridge->handle_id(((Dictionary)tv)["__godotHandle"]);
 		}
 		out["target"] = target;
 		Array args = d.get("args", Array());
@@ -481,7 +773,7 @@ JSValue js_godot_get(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv)
 		return JS_ThrowInternalError(ctx, "godot.get(handle, prop)");
 	}
 	uint64_t hid = handle_id_of(ctx, argv[0]);
-	const char *s = JS_ToCString(ctx, argv[1]);
+	const char *s = identifier_string(ctx, argv[1]);
 	String prop = s ? String::utf8(s) : String();
 	if (s) {
 		JS_FreeCString(ctx, s);
@@ -494,7 +786,7 @@ JSValue js_godot_set(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv)
 		return JS_ThrowInternalError(ctx, "godot.set(handle, prop, value)");
 	}
 	uint64_t hid = handle_id_of(ctx, argv[0]);
-	const char *s = JS_ToCString(ctx, argv[1]);
+	const char *s = identifier_string(ctx, argv[1]);
 	String prop = s ? String::utf8(s) : String();
 	if (s) {
 		JS_FreeCString(ctx, s);
@@ -509,7 +801,7 @@ JSValue js_godot_call(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv
 		return JS_ThrowInternalError(ctx, "godot.call(handle, method, ...args)");
 	}
 	uint64_t hid = handle_id_of(ctx, argv[0]);
-	const char *s = JS_ToCString(ctx, argv[1]);
+	const char *s = identifier_string(ctx, argv[1]);
 	String method = s ? String::utf8(s) : String();
 	if (s) {
 		JS_FreeCString(ctx, s);
@@ -520,7 +812,7 @@ JSValue js_godot_call(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv
 	}
 	String class_name;
 	if (JS_IsString(argv[0])) {
-		const char *name = JS_ToCString(ctx, argv[0]);
+		const char *name = identifier_string(ctx, argv[0]);
 		class_name = name ? String::utf8(name) : String();
 		if (name) JS_FreeCString(ctx, name);
 	}
@@ -533,7 +825,7 @@ JSValue js_godot_connect(JSContext *ctx, JSValueConst, int argc, JSValueConst *a
 		return JS_ThrowInternalError(ctx, "godot.connect(handle, signal, toHandle, method)");
 	}
 	uint64_t hid = handle_id_of(ctx, argv[0]);
-	const char *s = JS_ToCString(ctx, argv[1]);
+	const char *s = identifier_string(ctx, argv[1]);
 	String sig = s ? String::utf8(s) : String();
 	if (s) {
 		JS_FreeCString(ctx, s);
@@ -551,7 +843,7 @@ JSValue js_godot_disconnect(JSContext *ctx, JSValueConst, int argc, JSValueConst
 		return JS_ThrowInternalError(ctx, "godot.disconnect(handle, signal, toHandle, method)");
 	}
 	uint64_t hid = handle_id_of(ctx, argv[0]);
-	const char *s = JS_ToCString(ctx, argv[1]);
+	const char *s = identifier_string(ctx, argv[1]);
 	String sig = s ? String::utf8(s) : String();
 	if (s) {
 		JS_FreeCString(ctx, s);
@@ -581,6 +873,7 @@ void sweep_inflight(JSContext *ctx, ExecCtx *ec) {
 			JS_FreeValue(ctx, ret);
 			JS_FreeValue(ctx, arg);
 		} else {
+			if (!it->source.is_empty()) r.error_context["source"] = it->source;
 			JSValue arg = reject_value(ctx, r);
 			JSValue ret = JS_Call(ctx, it->reject, JS_UNDEFINED, 1, &arg);
 			JS_FreeValue(ctx, ret);
@@ -717,38 +1010,71 @@ Dictionary JsWorker::execute_one(const ExecRequest &req) {
 	JS_SetContextOpaque(ctx, &ec);
 
 	JSValue global = JS_GetGlobalObject(ctx);
+	JSValue prototype_probe = JS_NewObject(ctx);
+	ec.object_prototype = JS_GetPrototype(ctx, prototype_probe);
+	ec.object_class = JS_GetClassID(prototype_probe);
+	JS_FreeValue(ctx, prototype_probe);
+	ec.error_constructor = JS_GetPropertyStr(ctx, global, "Error");
+	{
+		OwnedJs prototype{ctx, JS_GetPropertyStr(ctx, ec.error_constructor, "prototype")};
+		auto accessor = [&](JSValueConst object, const char *name, bool setter = false) {
+			JSAtom key = JS_NewAtom(ctx, name);
+			OwnDescriptor own{ctx};
+			int found = JS_GetOwnProperty(ctx, &own.value, object, key);
+			JS_FreeAtom(ctx, key);
+			return found == 1 ? JS_DupValue(ctx, setter ? own.value.setter : own.value.getter) : JS_UNDEFINED;
+		};
+		ec.error_stack_getter = accessor(prototype.value, "stack");
+		ec.prepare_getter = accessor(ec.error_constructor, "prepareStackTrace");
+		ec.prepare_setter = accessor(ec.error_constructor, "prepareStackTrace", true);
+		ec.stack_limit_getter = accessor(ec.error_constructor, "stackTraceLimit");
+		OwnedJs limit_setter{ctx, accessor(ec.error_constructor, "stackTraceLimit", true)};
+		JSValue limit = JS_NewInt32(ctx, 32);
+		OwnedJs configured{ctx, JS_Call(ctx, limit_setter.value, ec.error_constructor, 1, &limit)};
+		JS_DefinePropertyValueStr(ctx, ec.error_constructor, "prepareStackTrace", JS_UNDEFINED, 0);
+		JS_DefinePropertyValueStr(ctx, ec.error_constructor, "stackTraceLimit", JS_NewInt32(ctx, 32), 0);
+	}
+	for (char character : req.code) if (character == '\n') ec.source_lines++;
 
 	// api.* — immutable authorized metadata surface (search tool).
 	if (api_index) {
 		JSValue api_obj = JS_NewObject(ctx);
+	JS_SetPropertyStr(ctx, api_obj, "types", JS_NewCFunction(ctx, guarded<js_api_types>, "types", 0));
+	JS_SetPropertyStr(ctx, api_obj, "describeType", JS_NewCFunction(ctx, guarded<js_api_describe_type>, "describeType", 1));
 		JS_SetPropertyStr(ctx, api_obj, "classes", JS_NewCFunction(ctx, js_api_classes, "classes", 0));
-		JS_SetPropertyStr(ctx, api_obj, "describe", JS_NewCFunction(ctx, js_api_describe, "describe", 1));
-		JS_SetPropertyStr(ctx, api_obj, "find", JS_NewCFunction(ctx, js_api_find, "find", 1));
+		JS_SetPropertyStr(ctx, api_obj, "describe", JS_NewCFunction(ctx, guarded<js_api_describe>, "describe", 1));
+		JS_SetPropertyStr(ctx, api_obj, "find", JS_NewCFunction(ctx, guarded<js_api_find>, "find", 1));
 		JS_SetPropertyStr(ctx, global, "api", api_obj);
 	}
 
 	if (!req.search_only) {
+		JS_SetPropertyStr(ctx, global, "checkpoint", JS_NewCFunction(ctx, guarded<js_checkpoint>, "checkpoint", 2));
 		JSValue godot_obj = JS_NewObject(ctx);
 		JS_SetPropertyStr(ctx, godot_obj, "mode", JS_NewString(ctx, req.mode.c_str()));
-		JS_SetPropertyStr(ctx, godot_obj, "create", JS_NewCFunction(ctx, js_godot_create, "create", 1));
-		JS_SetPropertyStr(ctx, godot_obj, "getSingleton", JS_NewCFunction(ctx, js_godot_singleton, "getSingleton", 1));
-		JS_SetPropertyStr(ctx, godot_obj, "get", JS_NewCFunction(ctx, js_godot_get, "get", 2));
-		JS_SetPropertyStr(ctx, godot_obj, "set", JS_NewCFunction(ctx, js_godot_set, "set", 3));
-		JS_SetPropertyStr(ctx, godot_obj, "call", JS_NewCFunction(ctx, js_godot_call, "call", 2));
+		JSValue values = JS_NewObject(ctx);
+		JS_SetPropertyStr(ctx, values, "inspect", JS_NewCFunction(ctx, guarded<js_value_inspect>, "inspect", 1));
+		JS_SetPropertyStr(ctx, values, "read", JS_NewCFunction(ctx, guarded<js_value_read>, "read", 2));
+		JS_SetPropertyStr(ctx, values, "release", JS_NewCFunction(ctx, guarded<js_value_release>, "release", 1));
+		JS_SetPropertyStr(ctx, godot_obj, "values", values);
+		JS_SetPropertyStr(ctx, godot_obj, "create", JS_NewCFunction(ctx, guarded<js_godot_create>, "create", 1));
+		JS_SetPropertyStr(ctx, godot_obj, "getSingleton", JS_NewCFunction(ctx, guarded<js_godot_singleton>, "getSingleton", 1));
+		JS_SetPropertyStr(ctx, godot_obj, "get", JS_NewCFunction(ctx, guarded<js_godot_get>, "get", 2));
+		JS_SetPropertyStr(ctx, godot_obj, "set", JS_NewCFunction(ctx, guarded<js_godot_set>, "set", 3));
+		JS_SetPropertyStr(ctx, godot_obj, "call", JS_NewCFunction(ctx, guarded<js_godot_call>, "call", 2));
 		JS_SetPropertyStr(ctx, godot_obj, "connect",
-				JS_NewCFunction(ctx, js_godot_connect, "connect", 4));
+				JS_NewCFunction(ctx, guarded<js_godot_connect>, "connect", 4));
 		JS_SetPropertyStr(ctx, godot_obj, "disconnect",
-				JS_NewCFunction(ctx, js_godot_disconnect, "disconnect", 4));
+				JS_NewCFunction(ctx, guarded<js_godot_disconnect>, "disconnect", 4));
 		JS_SetPropertyStr(ctx, godot_obj, "saveScene",
-				JS_NewCFunction(ctx, js_godot_save_scene, "saveScene", 0));
+				JS_NewCFunction(ctx, guarded<js_godot_save_scene>, "saveScene", 0));
 		JS_SetPropertyStr(ctx, godot_obj, "unlockWrites",
-				JS_NewCFunction(ctx, js_godot_unlock_writes, "unlockWrites", 0));
+				JS_NewCFunction(ctx, guarded<js_godot_unlock_writes>, "unlockWrites", 0));
 		JS_SetPropertyStr(ctx, godot_obj, "requestTier",
-				JS_NewCFunction(ctx, js_godot_request_tier, "requestTier", 1));
+				JS_NewCFunction(ctx, guarded<js_godot_request_tier>, "requestTier", 1));
 		JS_SetPropertyStr(ctx, godot_obj, "unlockedTiers",
-				JS_NewCFunction(ctx, js_godot_unlocked_tiers, "unlockedTiers", 0));
+				JS_NewCFunction(ctx, guarded<js_godot_unlocked_tiers>, "unlockedTiers", 0));
 		JS_SetPropertyStr(ctx, godot_obj, "batch",
-				JS_NewCFunction(ctx, js_godot_batch, "batch", 1));
+				JS_NewCFunction(ctx, guarded<js_godot_batch>, "batch", 1));
 		JSValue editor_obj = JS_NewObject(ctx);
 		JS_SetPropertyStr(ctx, editor_obj, "getEditedScene",
 				JS_NewCFunction(ctx, js_godot_editor_scene, "getEditedScene", 0));
@@ -763,14 +1089,7 @@ Dictionary JsWorker::execute_one(const ExecRequest &req) {
 	Dictionary out;
 	if (JS_IsException(val)) {
 		JSValue exc = JS_GetException(ctx);
-		JSValue str = JS_ToString(ctx, exc);
-		const char *s = JS_ToCString(ctx, str);
-		out = error_result(budget.tripped.load() ? "INTERRUPTED" : "JS_ERROR",
-				s ? s : "unknown error", "execute");
-		if (s) {
-			JS_FreeCString(ctx, s);
-		}
-		JS_FreeValue(ctx, str);
+		out = exception_result(ctx, exc, budget.tripped.load() ? "INTERRUPTED" : "JS_ERROR");
 		JS_FreeValue(ctx, exc);
 	} else if (JS_VALUE_GET_TAG(val) == JS_TAG_OBJECT &&
 			JS_PromiseState(ctx, val) != JS_PROMISE_NOT_A_PROMISE) {
@@ -832,7 +1151,7 @@ Dictionary JsWorker::execute_one(const ExecRequest &req) {
 			out = error_result("CANCELLED", "execution cancelled", "execute");
 		} else if (st == JS_PROMISE_FULFILLED) {
 			JSValue r = JS_PromiseResult(ctx, val);
-			JSValue json = JS_JSONStringify(ctx, r, JS_UNDEFINED, JS_UNDEFINED);
+			JSValue json = passive_json(ctx, r);
 			const char *s = JS_ToCString(ctx, json);
 			String text = s ? String::utf8(s) : String();
 			if (s) {
@@ -853,13 +1172,7 @@ Dictionary JsWorker::execute_one(const ExecRequest &req) {
 			JS_FreeValue(ctx, r);
 		} else if (st == JS_PROMISE_REJECTED) {
 			JSValue r = JS_PromiseResult(ctx, val);
-			JSValue str = JS_ToString(ctx, r);
-			const char *s = JS_ToCString(ctx, str);
-			out = error_result("JS_REJECTED", s ? s : "promise rejected", "execute");
-			if (s) {
-				JS_FreeCString(ctx, s);
-			}
-			JS_FreeValue(ctx, str);
+			out = exception_result(ctx, r, "JS_ERROR");
 			JS_FreeValue(ctx, r);
 		} else {
 			out = error_result(budget.tripped.load() ? "INTERRUPTED" : "UNSETTLED",
@@ -869,7 +1182,7 @@ Dictionary JsWorker::execute_one(const ExecRequest &req) {
 		}
 	} else {
 		// Non-promise value: user code didn't await anything; still a result.
-		JSValue json = JS_JSONStringify(ctx, val, JS_UNDEFINED, JS_UNDEFINED);
+		JSValue json = passive_json(ctx, val);
 		const char *s = JS_ToCString(ctx, json);
 		String text = s ? String::utf8(s) : String();
 		if (s) {
@@ -888,6 +1201,11 @@ Dictionary JsWorker::execute_one(const ExecRequest &req) {
 	}
 	JS_FreeValue(ctx, val);
 	JS_FreeValue(ctx, global);
+	if (!ec.encoding_error.is_empty()) {
+		out = base_result(false);
+		out["diagnostics"] = Array::make(ec.encoding_error);
+		if (String(ec.encoding_error.get("code", "")) == "OUTPUT_LIMIT") { out["truncated"] = true; out["result_omitted"] = true; }
+	}
 
 	bool pending_native_ops = ec.native_pending || !ec.inflight.empty();
 	if (pending_native_ops) {
@@ -904,6 +1222,13 @@ Dictionary JsWorker::execute_one(const ExecRequest &req) {
 		while (JS_ExecutePendingJob(rt, &pctx)) {
 		}
 	}
+	for (const KnownError &known : ec.known_errors) JS_FreeValue(ctx, known.value);
+	JS_FreeValue(ctx, ec.error_constructor);
+	JS_FreeValue(ctx, ec.error_stack_getter);
+	JS_FreeValue(ctx, ec.prepare_getter);
+	JS_FreeValue(ctx, ec.prepare_setter);
+	JS_FreeValue(ctx, ec.stack_limit_getter);
+	JS_FreeValue(ctx, ec.object_prototype);
 	JS_FreeContext(ctx);
 	JS_FreeRuntime(rt);
 	if (pending_native_ops && bridge) wait_bridge_op(bridge, "barrier", &ec);
@@ -933,6 +1258,7 @@ Dictionary JsWorker::execute_one(const ExecRequest &req) {
 	}
 	out["mode"] = req.mode.c_str();
 	out["rollback_supported"] = req.mode == "write";
+	out["checkpoints"] = ec.checkpoints;
 	// Op warnings (e.g. MIXED_SPACE) surface as diagnostics; the op itself
 	// already applied — the agent decides whether to act on the hint.
 	if (!ec.warnings.is_empty()) {
@@ -944,7 +1270,7 @@ Dictionary JsWorker::execute_one(const ExecRequest &req) {
 		}
 		out["diagnostics"] = diags;
 	}
-	return out;
+	return bounded_response(out);
 }
 
 } // namespace godot_cm

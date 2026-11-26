@@ -21,6 +21,7 @@
 namespace godot_cm {
 
 class ApiIndex;
+class ValueCodec;
 
 // One editor operation requested from JS (design D3/D7, spec godot-editor-bridge).
 struct BridgeOp {
@@ -43,6 +44,7 @@ struct BridgeResult {
 	godot::Variant value;               // Object* results arrive as {"$handle": id}
 	godot::String error_code;
 	godot::String error_message;
+	godot::Dictionary error_context;
 	godot::Array warnings;              // non-fatal hints, folded into execute diagnostics
 };
 
@@ -76,6 +78,9 @@ class Bridge {
 	std::unordered_map<uint64_t, godot::ObjectID> handles;
 	std::unordered_map<uint64_t, uint64_t> object_handles;
 	std::unordered_map<uint64_t, godot::Variant> values;
+	std::unordered_map<uint64_t, int64_t> value_sizes;
+	int64_t retained_value_bytes = 0;
+	godot::String generation;
 	uint64_t next_value = 1;
 	uint64_t next_handle = 1;
 	uint64_t next_op = 1;
@@ -89,12 +94,22 @@ class Bridge {
 	std::unordered_map<std::string, std::vector<std::shared_ptr<PendingBridge>>> tier_waiters;
 
 	uint64_t mint_handle(godot::Object *obj);
+	ValueCodec make_codec();
+	uint64_t reference_id(const godot::String &name, const char *kind) const;
+	godot::String reference_name(uint64_t id, const char *kind) const;
+	godot::Variant retain_value(const godot::Variant &value);
+	void rollback_values(uint64_t checkpoint);
+	BridgeResult value_operation(const BridgeOp &op);
+	BridgeResult encoded_result(const godot::Variant &value, bool dispatched = true);
+	godot::Array converted_args(const BridgeOp &op, godot::Object *target);
 	godot::Variant to_wire(const godot::Variant &v);
 	BridgeResult execute_op(const BridgeOp &op, const std::shared_ptr<TxState> &tx);
 	BridgeResult dispatch_op(const BridgeOp &op, const std::shared_ptr<TxState> &tx);
 	BridgeResult finish_tx(const std::shared_ptr<TxState> &tx, bool commit);
 
 public:
+	Bridge();
+	uint64_t handle_id(const godot::String &name) const;
 	ApiIndex *index = nullptr;
 	// Fired (main thread) when an op needs a tier unlock decision from the user.
 	std::function<void(const godot::String &tier)> tier_request_cb;

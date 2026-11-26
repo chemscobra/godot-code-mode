@@ -1,6 +1,8 @@
 #include "bridge.hpp"
+#include <godot_cpp/classes/json.hpp>
 
 #include "api_index.hpp"
+#include "value_codec.hpp"
 
 #include <godot_cpp/classes/class_db_singleton.hpp>
 #include <godot_cpp/classes/editor_interface.hpp>
@@ -38,6 +40,28 @@ void BridgePump::pump() {
 			last_catalog_refresh = now;
 		}
 	}
+}
+
+Bridge::Bridge() {
+	static std::atomic<uint64_t> sequence{0};
+	generation = String::num_uint64((uint64_t)std::chrono::steady_clock::now().time_since_epoch().count()) + String("_") + String::num_uint64(++sequence);
+}
+
+String Bridge::reference_name(uint64_t id, const char *kind) const {
+	return String(kind) + generation + String(".") + String::num_uint64(id);
+}
+
+uint64_t Bridge::reference_id(const String &name, const char *kind) const {
+	String prefix = String(kind) + generation + String(".");
+	if (!name.begins_with(prefix)) return 0;
+	String suffix = name.substr(prefix.length());
+	if (!suffix.is_valid_int()) return 0;
+	int64_t id = suffix.to_int();
+	return id > 0 && suffix == String::num_int64(id) ? (uint64_t)id : 0;
+}
+
+uint64_t Bridge::handle_id(const String &name) const {
+	return reference_id(name, "h");
 }
 
 uint64_t Bridge::mint_handle(Object *obj) {
@@ -102,65 +126,237 @@ static BridgeResult invoke_checked(Object *target, const StringName &method, con
 // Convert a Variant result into wire form: objects become handle dicts,
 // arrays and dictionaries are converted recursively.
 Variant Bridge::to_wire(const Variant &v) {
-	if (v.get_type() == Variant::OBJECT) {
-		Object *obj = v.get_validated_object();
-		if (obj == nullptr) {
-			return Variant();
+	uint64_t checkpoint = next_value;
+	try { return make_codec().encode(v); }
+	catch (...) { rollback_values(checkpoint); throw; }
+}
+
+void Bridge::rollback_values(uint64_t checkpoint) {
+	if (checkpoint == next_value) return;
+	for (auto entry = values.begin(); entry != values.end();) {
+		if (entry->first < checkpoint) { ++entry; continue; }
+		retained_value_bytes -= value_sizes[entry->first];
+		value_sizes.erase(entry->first);
+		entry = values.erase(entry);
+	}
+}
+
+Variant Bridge::retain_value(const Variant &value) {
+	int64_t bytes = ValueCodec::estimate(value);
+	if (values.size() >= ValueCodec::MAX_VALUE_REFERENCES || bytes > ValueCodec::MAX_VALUE_BYTES - retained_value_bytes) ValueCodec::fail("VALUE_REFERENCE_LIMIT", "retained value quota exceeded");
+	uint64_t id = next_value++;
+	values[id] = value;
+	value_sizes[id] = bytes;
+	retained_value_bytes += bytes;
+	Dictionary result;
+	result["__godotValue"] = reference_name(id, "v");
+	result["type"] = Variant::get_type_name(value.get_type());
+	return result;
+}
+
+ValueCodec Bridge::make_codec() {
+	ValueCodec codec;
+	codec.retain = [this](const Variant &value) { return retain_value(value); };
+	codec.retention_checkpoint = [this]() { return next_value; };
+	codec.rollback_retention = [this](uint64_t checkpoint) { rollback_values(checkpoint); };
+	codec.collection_type = [this](int builtin, const StringName &class_name, const Variant &script) {
+		if (script.get_type() == Variant::OBJECT && script.get_validated_object()) {
+			String name = index ? index->script_class(script.get_validated_object()) : String();
+			if (name.is_empty() || index->describe(name).get_type() != Variant::DICTIONARY) return Dictionary();
+			return ValueCodec::descriptor(name);
 		}
-		if (object_handles.find((uint64_t)obj->get_instance_id()) == object_handles.end()) {
-			if (Object::cast_to<RefCounted>(obj)) retained_rc.push_back(Ref<RefCounted>(v));
+		return ValueCodec::descriptor(builtin == Variant::NIL ? String("Variant") : builtin == Variant::OBJECT ? class_name.is_empty() ? String("Object") : String(class_name) : Variant::get_type_name((Variant::Type)builtin));
+	};
+	codec.resolve = [this](const Dictionary &wire, const String &path) -> Variant {
+		bool object = wire.has("__godotHandle"), value = wire.has("__godotValue");
+		if (object == value || wire.has("$handle")) ValueCodec::fail("INVALID_VALUE_ENCODING", "ambiguous reference envelope", path);
+		Variant name = wire[object ? "__godotHandle" : "__godotValue"];
+		if (name.get_type() != Variant::STRING) ValueCodec::fail("INVALID_VALUE_ENCODING", "reference identifier must be a string", path);
+		uint64_t id = reference_id(name, object ? "h" : "v");
+		if (object) {
+			auto entry = handles.find(id);
+			Object *target = entry == handles.end() ? nullptr : ObjectDB::get_instance(entry->second);
+			if (!target) ValueCodec::fail("INVALID_HANDLE", "object reference is stale or unknown", path);
+			return target;
 		}
-		uint64_t id = mint_handle(obj);
-		Dictionary h;
-		h["__godotHandle"] = "h" + String::num_uint64(id);
-		h["class_name"] = obj->get_class();
+		auto entry = values.find(id);
+		if (entry == values.end()) ValueCodec::fail("INVALID_VALUE_REFERENCE", "value reference is stale or unknown", path);
+		return entry->second;
+	};
+	codec.object_wire = [this](const Variant &value) -> Variant {
+		Object *obj = value.get_validated_object();
+		if (!obj) return Variant();
+		if (object_handles.find((uint64_t)obj->get_instance_id()) == object_handles.end() && Object::cast_to<RefCounted>(obj)) retained_rc.push_back(Ref<RefCounted>(value));
+		Dictionary result;
+		result["__godotHandle"] = reference_name(mint_handle(obj), "h");
+		result["class_name"] = obj->get_class();
 		if (index) {
 			String script = index->script_class(obj);
-			if (!script.is_empty()) h["script_class"] = script;
+			if (!script.is_empty()) result["script_class"] = script;
 		}
-		return h;
-	}
-	if (v.get_type() == Variant::ARRAY) {
-		Array a = v;
-		Array out;
-		for (int i = 0; i < a.size(); i++) {
-			out.push_back(to_wire(a[i]));
+		return result;
+	};
+	codec.object_matches = [this](Object *object, const String &cls) {
+		if (object->is_class(cls)) return true;
+		String current = index ? index->script_class(object) : String();
+		for (int i = 0; !current.is_empty() && i < 64; i++) {
+			if (current == cls) return true;
+			Variant entry = index->describe(current);
+			if (entry.get_type() != Variant::DICTIONARY) break;
+			current = ((Dictionary)entry).get("inherits", "");
 		}
-		return out;
+		return false;
+	};
+	codec.storage_type = [this](const Dictionary &descriptor) {
+		Dictionary result = descriptor.duplicate();
+		String cls = result.get("class_name", "");
+		if (cls.is_empty() || ClassDBSingleton::get_singleton()->class_exists(cls)) return result;
+		Variant entry = index ? index->describe(cls) : Variant();
+		String path = entry.get_type() == Variant::DICTIONARY ? String(((Dictionary)entry).get("path", "")) : String();
+		ResourceLoader *loader = ResourceLoader::get_singleton();
+		if (path.is_empty() || !loader->has_cached(path)) ValueCodec::fail("TYPE_METADATA_UNAVAILABLE", "typed script collection requires already cached metadata", "type");
+		Ref<Script> script(loader->get_cached_ref(path));
+		if (script.is_null()) ValueCodec::fail("TYPE_METADATA_UNAVAILABLE", "cached collection type is not a script", "type");
+		result["class_name"] = script->get_instance_base_type();
+		result["script"] = script;
+		return result;
+	};
+	return codec;
+}
+
+BridgeResult Bridge::value_operation(const BridgeOp &op) {
+	if (op.args.is_empty() || op.args[0].get_type() != Variant::DICTIONARY) ValueCodec::fail("INVALID_VALUE_REFERENCE", "expected a value reference", "reference");
+	Dictionary reference = op.args[0];
+	if (reference.has("__godotHandle")) ValueCodec::fail("REFERENCE_KIND_MISMATCH", "expected a value reference, not an object handle", "reference");
+	if (!reference.has("__godotValue")) ValueCodec::fail("INVALID_VALUE_REFERENCE", "expected a value reference", "reference");
+	ValueCodec codec = make_codec();
+	Variant value = codec.resolve(reference, "reference");
+	uint64_t id = reference_id(reference["__godotValue"], "v");
+	String kind = op.kind.c_str();
+	if (kind == "value_release") {
+		if (!op.untracked) return op_error("UNTRACKED_REQUIRED", "value release requires authorized untracked mode");
+		retained_value_bytes -= value_sizes[id];
+		value_sizes.erase(id);
+		values.erase(id);
+		Dictionary result; result["released"] = true;
+		return op_value(result);
 	}
-	if (v.get_type() == Variant::DICTIONARY) {
-		Dictionary d = v;
-		Dictionary out;
-		for (const Variant &k : d.keys()) {
-			out[k] = to_wire(d[k]);
+	int type = value.get_type();
+	bool dictionary = type == Variant::DICTIONARY;
+	bool collection = dictionary || type == Variant::ARRAY || type >= Variant::PACKED_BYTE_ARRAY;
+	bool text = type == Variant::STRING;
+	std::vector<ValueField> fields = ValueCodec::fields(type);
+	int64_t size = collection ? (int64_t)value.call("size") : text ? String(value).length() : (int64_t)fields.size();
+	Dictionary result;
+	result["type"] = Variant::get_type_name(value.get_type());
+	result["variant_type"] = type;
+	if (kind == "value_inspect") {
+		result["size"] = size;
+		result["readable"] = collection || text || !fields.empty();
+		Array names; for (const ValueField &field : fields) names.push_back(field.name);
+		result["fields"] = names;
+		result["accounted_bytes"] = value_sizes[id];
+		result["retained_references"] = (int64_t)values.size();
+		result["retained_accounted_bytes"] = retained_value_bytes;
+		result["reference_limit"] = ValueCodec::MAX_VALUE_REFERENCES;
+		result["accounted_byte_limit"] = ValueCodec::MAX_VALUE_BYTES;
+		return op_value(result);
+	}
+	if (!collection && !text && fields.empty()) return op_error("UNSUPPORTED_VALUE_OPERATION", "value supports passive metadata only");
+	Dictionary options;
+	if (op.args.size() > 1) {
+		if (op.args[1].get_type() != Variant::DICTIONARY) ValueCodec::fail("INVALID_VALUE_RANGE", "expected range options", "options");
+		options = op.args[1];
+	}
+	for (const Variant &key : options.keys()) if (key != Variant("offset") && key != Variant("limit")) ValueCodec::fail("INVALID_VALUE_RANGE", "unknown range option", "options");
+	int64_t offset = codec.decode(options.get("offset", 0), ValueCodec::descriptor("int"), "options.offset");
+	int64_t limit = codec.decode(options.get("limit", 64), ValueCodec::descriptor("int"), "options.limit");
+	if (offset < 0 || offset > size || limit < 1 || limit > ValueCodec::INLINE_ELEMENTS) ValueCodec::fail("INVALID_VALUE_RANGE", "offset or limit out of range", "options");
+	result["offset"] = offset;
+	result["total"] = size;
+	Array items;
+	Dictionary named;
+	Variant cursor;
+	bool valid = false, more = dictionary ? value.iter_init(cursor, valid) : false;
+	if (dictionary) for (int64_t i = 0; i < offset && more; i++) more = value.iter_next(cursor, valid);
+	int64_t count = 0;
+	for (int64_t i = offset; i < size && count < limit; i++) {
+		uint64_t checkpoint = next_value;
+		Variant item, encoded;
+		String field_name;
+		if (dictionary) {
+			if (!more || !valid) ValueCodec::fail("INVALID_VALUE_REFERENCE", "dictionary changed during paging", "reference");
+			Variant key = value.iter_get(cursor, valid);
+			item = Dictionary(value)[key];
+			Dictionary entry; entry["key"] = to_wire(key); entry["value"] = to_wire(item); encoded = entry;
+		} else if (text) item = String(value).substr(i, 1);
+		else if (collection) { bool oob = false; item = value.get_indexed(i, valid, oob); }
+		else { field_name = fields[i].name; item = value.get_named(field_name, valid); }
+		if (!dictionary) encoded = to_wire(item);
+		if (JSON::stringify(encoded).utf8().length() > ValueCodec::INLINE_BYTES - 512) {
+			rollback_values(checkpoint);
+			if (dictionary) {
+				Variant key = value.iter_get(cursor, valid);
+				Dictionary entry; entry["key"] = ValueCodec::estimate(key) > 1024 ? retain_value(key) : to_wire(key); entry["value"] = item.get_type() == Variant::OBJECT ? to_wire(item) : retain_value(item); encoded = entry;
+			} else encoded = item.get_type() == Variant::OBJECT ? to_wire(item) : retain_value(item);
 		}
-		return out;
-	}
-	if (v.get_type() == Variant::VECTOR2 || v.get_type() == Variant::VECTOR3 || v.get_type() == Variant::COLOR) {
-		Dictionary tagged;
-		tagged["$t"] = Variant::get_type_name(v.get_type());
-		if (v.get_type() == Variant::VECTOR2) {
-			Vector2 point = v;
-			tagged["x"] = point.x; tagged["y"] = point.y;
-		} else if (v.get_type() == Variant::VECTOR3) {
-			Vector3 point = v;
-			tagged["x"] = point.x; tagged["y"] = point.y; tagged["z"] = point.z;
-		} else {
-			Color color = v;
-			tagged["r"] = color.r; tagged["g"] = color.g; tagged["b"] = color.b; tagged["a"] = color.a;
+		items.push_back(encoded);
+		if (!field_name.is_empty()) named[field_name] = encoded;
+		result[dictionary ? "entries" : fields.empty() ? "items" : "fields"] = fields.empty() ? Variant(items) : Variant(named);
+		if (JSON::stringify(result).utf8().length() > ValueCodec::INLINE_BYTES - 256) {
+			items.pop_back(); if (!field_name.is_empty()) named.erase(field_name);
+			rollback_values(checkpoint);
+			if (count == 0) ValueCodec::fail("OUTPUT_LIMIT", "element cannot fit in a bounded page", "reference");
+			break;
 		}
-		return tagged;
+		count++;
+		if (dictionary) more = value.iter_next(cursor, valid);
 	}
-	if (v.get_type() > Variant::STRING) {
-		if (v.get_type() == Variant::STRING_NAME || v.get_type() == Variant::NODE_PATH) return String(v);
-		uint64_t id = next_value++;
-		values[id] = v;
-		Dictionary value;
-		value["__godotValue"] = "v" + itos(id);
-		value["type"] = Variant::get_type_name(v.get_type());
-		return value;
+	result[dictionary ? "entries" : fields.empty() ? "items" : "fields"] = fields.empty() ? Variant(items) : Variant(named);
+	result["count"] = count;
+	result["next_offset"] = offset + count < size ? Variant(offset + count) : Variant();
+	result["truncated"] = offset + count < size;
+	return op_value(result);
+}
+
+BridgeResult Bridge::encoded_result(const Variant &value, bool dispatched) {
+	try {
+		BridgeResult result = op_value(to_wire(value));
+		result.dispatched = dispatched;
+		return result;
+	} catch (const ValueFailure &failure) {
+		BridgeResult result = op_error(failure.diagnostic["code"], failure.diagnostic["message"]);
+		result.error_context = failure.diagnostic;
+		result.dispatched = dispatched;
+		return result;
 	}
-	return v;
+}
+
+Array Bridge::converted_args(const BridgeOp &op, Object *target) {
+	String kind = op.kind.c_str();
+	if (kind == "batch" || kind.begins_with("value_")) return op.args;
+	Dictionary signature;
+	String cls = target ? String(target->get_class()) : String(op.class_name.c_str());
+	if (index && (kind == "set" || kind == "call" || kind == "create")) {
+		String member = kind == "create" ? String("_init") : String(op.member.c_str());
+		if (target && index->member_declared(index->script_class(target), member)) signature = index->member_info(index->script_class(target), member, kind == "set");
+		else signature = index->member_info(cls, member, kind == "set");
+	}
+	Array parameters = signature.get("arguments", Array());
+	if ((kind == "call" || kind == "create") && !signature.is_empty()) {
+		int required = 0;
+		for (const Variant &item : parameters) if (!((Dictionary)item).has("default")) required++;
+		if (op.args.size() < required || (!(bool)signature.get("is_vararg", false) && op.args.size() > parameters.size())) ValueCodec::fail("BAD_ARGS", "argument count does not match the declared signature", "args");
+	}
+	ValueCodec codec = make_codec();
+	Array result;
+	for (int i = 0; i < op.args.size(); i++) {
+		Dictionary expected = kind == "set" ? signature : i < parameters.size() ? Dictionary(parameters[i]) : Dictionary();
+		String path = kind == "set" ? String("value") : String("args[") + itos(i) + String("]");
+		try { result.push_back(codec.decode(op.args[i], expected, path)); }
+		catch (ValueFailure &failure) { failure.diagnostic["argument"] = i; throw; }
+	}
+	return result;
 }
 
 // Resolve a handle id to a live Object*, or null.
@@ -445,7 +641,8 @@ BridgeResult Bridge::execute_op(const BridgeOp &incoming, const std::shared_ptr<
 	BridgeOp op = incoming;
 	String kind = op.kind.c_str();
 	Object *target = resolve_handle(handles, op.target);
-	if (kind == "create" || kind == "set" || kind == "connect" || kind == "disconnect" || kind == "save_scene" || kind == "unlock_writes") op.write = true;
+	if (kind == "create" || kind == "set" || kind == "connect" || kind == "disconnect" || kind == "save_scene" || kind == "unlock_writes" || kind == "value_release") op.write = true;
+	if (kind == "value_release" && !op.untracked) return op_error("UNTRACKED_REQUIRED", "value release requires authorized untracked mode");
 	if (index && (target || kind == "create" || kind == "call" || kind == "singleton")) {
 		if (target) index->observe_script(target);
 		index->refresh();
@@ -476,7 +673,21 @@ BridgeResult Bridge::execute_op(const BridgeOp &incoming, const std::shared_ptr<
 	}
 	String effect_class = target ? String(target->get_class()) : String(op.class_name.c_str());
 	if (op.write && kind != "unlock_writes" && write_locked.load()) return op_error("TX_LOCKED", "writes locked pending review");
-	BridgeResult result = dispatch_op(op, tx);
+	BridgeResult result;
+	uint64_t checkpoint = next_value;
+	try {
+		op.args = converted_args(op, target);
+		result = dispatch_op(op, tx);
+	} catch (const ValueFailure &failure) {
+		rollback_values(checkpoint);
+		result = op_error(failure.diagnostic["code"], failure.diagnostic["message"]);
+		result.error_context = failure.diagnostic;
+	}
+	if (!result.ok) {
+		result.error_context["operation"] = kind;
+		result.error_context["class"] = effect_class;
+		result.error_context["member"] = String(op.member.c_str());
+	}
 	result.write = op.write;
 	if (op.untracked && op.write && tx && (result.ok || result.dispatched)) {
 		Dictionary effect;
@@ -493,6 +704,7 @@ BridgeResult Bridge::execute_op(const BridgeOp &incoming, const std::shared_ptr<
 BridgeResult Bridge::dispatch_op(const BridgeOp &op, const std::shared_ptr<TxState> &tx) {
 	const String kind = op.kind.c_str();
 	if (kind == "barrier") return op_value(Variant());
+	if (kind.begins_with("value_")) return value_operation(op);
 
 	if (kind == "tx_commit") {
 		return finish_tx(tx, true);
@@ -591,9 +803,10 @@ BridgeResult Bridge::dispatch_op(const BridgeOp &op, const std::shared_ptr<TxSta
 			if (r.ok) {
 				rd["result"] = r.value;
 			} else {
-				Dictionary e;
+				Dictionary e = r.error_context.duplicate(true);
 				e["code"] = r.error_code;
 				e["message"] = r.error_message;
+				e["batch_index"] = i;
 				rd["error"] = e;
 			}
 			results.push_back(rd);
@@ -634,7 +847,7 @@ BridgeResult Bridge::dispatch_op(const BridgeOp &op, const std::shared_ptr<TxSta
 		bool project_class = String(entry.get("kind", "")) == "script_class";
 		Array args;
 		if (!project_class) { args.push_back(cls); args.push_back(method); }
-		for (const Variant &arg : op.args) args.push_back(unwrap_arg(handles, values, arg));
+		for (const Variant &arg : op.args) args.push_back(arg);
 		Ref<Script> script;
 		if (project_class) {
 			String path = entry.get("path", "");
@@ -682,7 +895,7 @@ BridgeResult Bridge::dispatch_op(const BridgeOp &op, const std::shared_ptr<TxSta
 			Ref<Script> script(loader->has_cached(path) ? loader->get_cached_ref(path) : loader->load(path));
 			if (script.is_null()) return op_error("LOAD_FAILED", "project script could not be loaded");
 			Array constructor_args;
-			for (const Variant &arg : op.args) constructor_args.push_back(unwrap_arg(handles, values, arg));
+			for (const Variant &arg : op.args) constructor_args.push_back(arg);
 			BridgeResult result = invoke_checked(script.ptr(), "new", constructor_args);
 			if (!result.ok) return result;
 			created = result.value;
@@ -707,7 +920,7 @@ BridgeResult Bridge::dispatch_op(const BridgeOp &op, const std::shared_ptr<TxSta
 		journal(tx.get(), simple_op("ref", oid), simple_op("free", oid));
 		uint64_t hid = mint_handle(obj);
 		Dictionary wire;
-		wire["__godotHandle"] = "h" + String::num_uint64(hid);
+		wire["__godotHandle"] = reference_name(hid, "h");
 		wire["class_name"] = obj->get_class();
 		String script_class = index->script_class(obj);
 		if (!script_class.is_empty()) wire["script_class"] = script_class;
@@ -727,7 +940,7 @@ BridgeResult Bridge::dispatch_op(const BridgeOp &op, const std::shared_ptr<TxSta
 		StringName sig = StringName(String(op.member.c_str()));
 		Object *to = nullptr;
 		if (op.args.size() > 0) {
-			Variant tov = unwrap_arg(handles, values, op.args[0]);
+			Variant tov = op.args[0];
 			to = tov.get_type() == Variant::OBJECT ? (Object *)tov : nullptr;
 		}
 		if (to == nullptr) {
@@ -746,9 +959,6 @@ BridgeResult Bridge::dispatch_op(const BridgeOp &op, const std::shared_ptr<TxSta
 			int flags = op.args.size() > 2 ? (int)(int64_t)op.args[2] : 0;
 			if (op.args.size() > 3) {
 				Array binds = op.args[3];
-				for (int b = 0; b < binds.size(); b++) {
-					binds[b] = unwrap_arg(handles, values, binds[b]);
-				}
 				if (!binds.is_empty()) {
 					cb = cb.bindv(binds);
 				}
@@ -786,7 +996,7 @@ BridgeResult Bridge::dispatch_op(const BridgeOp &op, const std::shared_ptr<TxSta
 			return op_error("PERMISSION", member_denied_msg(index, target, "property", prop));
 		}
 		Variant v = target->get(prop);
-		return op_value(to_wire(v));
+		return encoded_result(v);
 	}
 
 	if (kind == "set") {
@@ -794,7 +1004,7 @@ BridgeResult Bridge::dispatch_op(const BridgeOp &op, const std::shared_ptr<TxSta
 		if (!member_authorized(index, target, prop, true)) {
 			return op_error("PERMISSION", member_denied_msg(index, target, "property", prop));
 		}
-		Variant arg = op.args.size() > 0 ? unwrap_arg(handles, values, op.args[0]) : Variant();
+		Variant arg = op.args.size() > 0 ? op.args[0] : Variant();
 		uint64_t oid = (uint64_t)target->get_instance_id();
 		Variant prior = target->get(prop);
 		target->set(prop, arg);
@@ -817,7 +1027,7 @@ BridgeResult Bridge::dispatch_op(const BridgeOp &op, const std::shared_ptr<TxSta
 		}
 		Array args;
 		for (int i = 0; i < op.args.size(); i++) {
-			args.push_back(unwrap_arg(handles, values, op.args[i]));
+			args.push_back(op.args[i]);
 		}
 		uint64_t oid = (uint64_t)target->get_instance_id();
 
@@ -923,7 +1133,7 @@ BridgeResult Bridge::dispatch_op(const BridgeOp &op, const std::shared_ptr<TxSta
 			i["prop"] = "global_transform"; i["val"] = prior_tf;
 			journal(tx.get(), f, i);
 		}
-		BridgeResult r = op_value(to_wire(v));
+		BridgeResult r = encoded_result(v);
 		r.warnings = warns;
 		return r;
 	}

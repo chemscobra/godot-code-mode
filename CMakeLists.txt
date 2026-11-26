@@ -21,6 +21,7 @@ target_include_directories(quickjs_ng PUBLIC quickjs)
 add_library(godot_cm SHARED
 	src/api_index.cpp
 	src/bridge.cpp
+	src/value_codec.cpp
 	src/js_worker.cpp
 	src/mcp_service.cpp
 	src/register_types.cpp

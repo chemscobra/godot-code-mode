@@ -87,6 +87,13 @@ Discovery never loads or instantiates an uncached script: these entries carry
 `metadata_status:"class_only"` until explicitly loaded. Cached script members,
 paths, source, constructor mode and member execution modes are described too.
 Godot's own rules still apply, including tool-script and signature requirements.
+Member type descriptors retain `variant_type`, `class_name`, `usage`, `hint`,
+`hint_string` and available `element_type` or `key_type`/`value_type` constraints.
+Method arguments include their zero-based `index`, declared defaults and vararg
+status. `Variant` or unavailable metadata does not imply a concrete conversion
+context: `{x:1,y:2,z:3}` remains a dictionary there unless explicitly tagged.
+Discovering a class or its parameter types does not authorize constructing or
+calling it; the execution mode and permission tiers are checked separately.
 
 Inside `execute`: `godot.editor.getEditedScene()`, `godot.create(cls, ...args)`,
 `godot.getSingleton(name)`, `godot.get/set(handle, prop, v)`,
@@ -130,22 +137,166 @@ JavaScript cancellation cannot preempt a running native method. The bridge waits
 for in-flight native calls to settle before reporting their effects; if the outer
 worker deadline expires first, `outcome:"unknown"` is returned instead.
 
-Vectors/colors use tagged values such as `{$t:"Vector3",x:1,y:2,z:3}`.
-Packed inputs use `{$t:"PackedByteArray",values:[0,1,255]}` (also numeric,
-string, vector and color packed arrays). Other non-JSON values are opaque
-`__godotValue` references that can be passed back as arguments/properties.
+Known mathematical destinations accept named fields, or explicit tags such as
+`{$t:"Vector3",x:1,y:2,z:3}`. Missing, extra and incompatible components fail
+before assignment/invocation. Positional arrays are not mathematical inputs.
+`Variant`/untyped destinations preserve ordinary objects as dictionaries;
+use `$t` to express a different type there. Color requires RGB; omitted alpha
+is 1. HDR/negative channels are not clamped or converted to another color space.
+Integers must be safe JavaScript Numbers, signed-64 BigInts, or canonical decimal
+`{$t:"int",value:"9223372036854775807"}` values. Large integer outputs keep that
+tag. Special scalar floats use `{$t:"float",value:"NaN"}` with `NaN`,
+`+Infinity`, `-Infinity` or `-0`. Mathematical outputs have their concrete tags;
+native mathematical values with non-finite components remain opaque references.
+Packed inputs accept ordinary arrays in a known destination or explicit forms
+such as `{$t:"PackedByteArray",values:[0,1,255]}`. Non-JSON/large values may be
+opaque `__godotValue` references that can be passed back as arguments/properties.
+Data transport rejects active accessors/toJSON hooks, proxies, functions,
+symbols, sparse arrays, nested undefined, cycles and strings that Godot cannot
+represent without loss. It does not execute those hooks to obtain data.
+
+The worker reserves intrinsic `Error.prepareStackTrace=undefined` and
+`Error.stackTraceLimit=32` as non-writable/non-configurable properties. These
+worker-local restrictions keep diagnostic generation passive; they do not
+change bridge permissions or the user's project.
+
+Rotation units belong to the Godot property, not to Vector3. For example:
+
+```js
+await godot.set(node, "rotation_degrees", {x:0,y:90,z:0});
+await godot.set(node, "rotation", {x:0,y:Math.PI/2,z:0});
+await godot.set(node, "quaternion", {x:0,y:0,z:0,w:1});
+await godot.set(node, "basis", {
+  x:{x:1,y:0,z:0}, y:{x:0,y:1,z:0}, z:{x:0,y:0,z:1}
+});
+await godot.set(node, "transform", {
+  basis:{x:{x:1,y:0,z:0}, y:{x:0,y:1,z:0}, z:{x:0,y:0,z:1}},
+  origin:{x:1,y:2,z:3}
+});
+```
+
+`rotation` uses radians, `rotation_degrees` uses degrees; neither is converted
+by the codec. `rotation_order` remains the node's Euler order. `basis`,
+`quaternion` and `transform` use their own concrete types; Vector4 is not a
+Quaternion. Basis/Projection axes are columns. Transform2D has `x`, `y`,
+`origin`; Transform3D has `basis`, `origin`. The codec does not transpose,
+normalize or invent identity components. Local/global properties keep their
+Godot meanings; Godot setters can still enforce their own domain semantics.
+
+Unlike 0.2.1, StringName and NodePath outputs preserve identity as
+`{$t:"StringName",value:"name"}` and `{$t:"NodePath",value:"path"}` rather than
+bare strings. Use `.value` when text is needed. Re-sending the tag to a Variant
+parameter preserves the concrete type; NodePath transport does not resolve nodes.
+
 Object references include their native `class_name` and, when applicable,
 `script_class`; use that symbol with `api.describe()` or `godot.create()`.
 Unknown allocator methods may return caller-owned orphan nodes; adopt/free
 them explicitly rather than expecting the bridge to delete borrowed objects.
-Runtime declarations are written to `user://godot_cm-api-surface.d.ts`.
+Set `GODOT_CM_GENERATE_DTS=1` to write runtime declarations to
+`user://godot_cm-api-surface.d.ts`; normal activation skips generation. The
+`GodotClass_*` interfaces describe reflected signatures, not callable JavaScript
+globals. Use `godot.call` to invoke an authorized class or object. Metadata
+`default_status:"unavailable"` distinguishes an unrepresentable default from a
+known null default; the native invocation still applies its own omitted defaults.
+
+### Collections and retained values
+
+Use `search` with `return api.types()` or `return api.describeType("Basis")`
+for the 39-type inventory, component schemas, formats and limits. Discovery
+never grants execution rights or loads a script to complete a type.
+
+Collections of at most **256 elements and 16 KiB encoded** can be inline.
+Packed collections use `{$t:"PackedStringArray",values:["one","two"]}`;
+typed arrays retain `element_type`, and typed dictionaries retain
+`key_type`/`value_type`. Larger, deep or cyclic native collections use opaque
+`{__godotValue:"...",type:"..."}` references. These are **not object handles**:
+calling `godot.get/call` on one produces `REFERENCE_KIND_MISMATCH`.
+
+```js
+const info = await godot.values.inspect(valueReference);
+const page = await godot.values.read(valueReference, {offset:0, limit:64});
+return {info, page};
+```
+
+Pages have `type`, `offset`, `count`, `total`, `next_offset` and `truncated`,
+plus `items`, dictionary `entries`, or mathematical `fields`. Text references
+page Unicode characters in `items`. Defaults are offset 0 and limit 64; limits
+are 1..256, with at most 16 KiB per encoded page. A large element can itself
+be a retained reference. RID/Callable/Signal expose passive metadata only;
+reading unsupported structure reports `UNSUPPORTED_VALUE_OPERATION`, without
+invoking a callback, getter or signal. The received `type` label is advisory:
+actual identity and compatibility come from the server registry.
+
+Retained values survive executions within the current service generation.
+Restarting the service invalidates old object/value identifiers. Quotas are
+**4096 retained values and 64 MiB of accounted storage**, with no silent
+eviction. Accounting is a bounded recursive estimate at retention, not a live
+heap/GPU measurement; shared payloads can be counted more than once and mutable
+values can subsequently change. Exhaustion reports `VALUE_REFERENCE_LIMIT`.
+`await godot.values.release(ref)` requires authorized `untracked` mode and
+invalidates only that reference, not aliases. It never explicitly frees a
+borrowed object, but final refcount cleanup can have effects and cannot be undone.
+Retained typed collections keep native restrictions; an opaque untyped
+collection does not acquire a narrower type by changing its client label.
+
+For non-string or reserved dictionary keys, use the literal entries form:
+
+```js
+const data = {$t:"Dictionary", entries:[
+  {key:"$t", value:"literal data"},
+  {key:"__godotValue", value:"not a reference"},
+  {key:1, value:"integer key"}
+]};
+```
+
+The resulting dictionary is not interpreted again as an envelope. String key
+`"1"` does not become integer key `1`; duplicate keys after contextual conversion
+are rejected rather than overwritten.
+
+### Diagnostics and checkpoints
+
+Errors retain codes such as `TYPE_MISMATCH`, `INVALID_HANDLE`,
+`INVALID_VALUE_REFERENCE`, `PERMISSION` and `UNAWAITED_VALUE`, with available
+`operation`, `class`, `member`, `argument`, `path`, `expected`, `received`,
+`batch_index` and `source:{line,column,stack}`. Locations refer to submitted JS;
+unavailable locations are omitted. `path:"value.y"` identifies a bad component,
+not a recovered local variable. No automatic argument or local-variable dump is
+included. A successful native invocation does not prove plugin-domain success.
+
+```js
+const position = await godot.get(node, "position");
+checkpoint("before", position);
+await godot.set(node, "position", {x:1,y:"bad",z:3});
+```
+
+`checkpoint(name,value)` is **synchronous**, unlike the asynchronous `godot.*`
+operations. Responses retain ordered `{name,value}` snapshots even after failure;
+repeated names append rather than replace entries. Limits: 32 entries, 1..128
+UTF-8 bytes per name, 64 KiB for the encoded checkpoint list including its JSON
+envelopes, and value depth 32. `CHECKPOINT_LIMIT` leaves prior entries intact.
+Capture is passive: no getters, promises, cycles or active formatters. References
+remain references, not copies of live scene state. Nothing is written to files
+or retained in the next execution.
+
+`result` is the final returned value, or null for void/no final result;
+`checkpoints` are historical observations; `effects` records dispatched
+untracked operations. Checkpoints alone do not set `partial:true` or create Undo
+actions. A checkpoint before rollback is not rewritten into post-rollback state.
+A recorded handle can later expire. Await nested operations before capturing or
+returning their values; returning a bridge promise directly remains valid.
+
+The execution envelope before MCP wrapping is bounded to 256 KiB. `truncated`,
+`result_omitted`, `effects_omitted`, `changes_omitted`, `diagnostics_omitted` and
+metadata omission counts identify incomplete data. The primary error and
+completed checkpoints are retained; an effect prefix is not a complete history.
 
 `godot.batch` applies a list of ops in **one** main-thread dispatch and
 resolves with ordered per-element results — the fast path for op-dense
 scripts (see `docs/benchmarks.md`).
 
-Budgets per call: 5 s wall (raise via `timeoutMs`), 32 MiB heap, 1,000 ops,
-256 KiB output.
+Default cooperative budgets: 5 s for read and 60 s for write/untracked (adjust
+via `timeoutMs`), 32 MiB JS heap, 1,000 operations and a 256 KiB execution
+envelope before MCP wrapping. Native methods cannot be forcibly interrupted.
 
 ## Build
 

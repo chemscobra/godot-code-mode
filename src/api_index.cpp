@@ -1,4 +1,5 @@
 #include "api_index.hpp"
+#include "value_codec.hpp"
 
 #include <godot_cpp/classes/file_access.hpp>
 #include <godot_cpp/classes/json.hpp>
@@ -52,13 +53,54 @@ static bool reversible_method(const String &owner, const String &method) {
 	return (owner == "Node3D" || owner == "Node2D") && (method == "look_at" || method == "look_at_from_position");
 }
 
+static Dictionary collection_type(const String &name) {
+	Dictionary result;
+	if (name.is_empty()) return result;
+	for (int i = 0; i < Variant::VARIANT_MAX; i++) {
+		if (name == Variant::get_type_name((Variant::Type)i) || (i == Variant::NIL && name == "Variant")) {
+			result["variant_type"] = i;
+			result["type"] = name;
+			return result;
+		}
+	}
+	if (name.is_valid_identifier()) {
+		result["variant_type"] = (int)Variant::OBJECT;
+		result["type"] = name;
+		result["class_name"] = name;
+	}
+	return result;
+}
+
 static Dictionary reflected_type(const Dictionary &raw, bool returns = false) {
 	Dictionary result;
 	result["name"] = raw.get("name", "");
 	String cls = raw.get("class_name", "");
-	Variant type = raw.get("type", (int)Variant::NIL);
-	result["type"] = !cls.is_empty() ? cls : type.get_type() == Variant::INT ? Variant::get_type_name((Variant::Type)(int)type) : String(type);
-	if (type.get_type() == Variant::INT && (int)type == Variant::NIL) result["type"] = ((int)raw.get("usage", 0) & PROPERTY_USAGE_NIL_IS_VARIANT) ? "Variant" : returns ? "void" : "Variant";
+	Variant raw_type = raw.get("type", Variant());
+	bool known = raw_type.get_type() == Variant::INT;
+	int type = known ? (int)raw_type : (int)Variant::NIL;
+	int usage = raw.get("usage", 0);
+	int hint = raw.get("hint", 0);
+	String hint_string = raw.get("hint_string", "");
+	result["variant_type"] = known ? Variant(type) : Variant();
+	result["class_name"] = cls;
+	result["usage"] = usage;
+	result["hint"] = hint;
+	result["hint_string"] = hint_string;
+	result["metadata_status"] = known ? "declared" : "unknown";
+	result["type"] = type == Variant::OBJECT && !cls.is_empty() ? cls : Variant::get_type_name((Variant::Type)type);
+	if (type == Variant::NIL) result["type"] = (usage & PROPERTY_USAGE_NIL_IS_VARIANT) || !returns ? "Variant" : "void";
+	if (type == Variant::ARRAY && hint == PROPERTY_HINT_ARRAY_TYPE) {
+		Dictionary element = collection_type(hint_string);
+		if (!element.is_empty()) result["element_type"] = element;
+	}
+	if (type == Variant::DICTIONARY && hint == PROPERTY_HINT_DICTIONARY_TYPE) {
+		PackedStringArray parts = hint_string.split(";");
+		if (parts.size() == 2) {
+			Dictionary key = collection_type(parts[0]), value = collection_type(parts[1]);
+			if (!key.is_empty()) result["key_type"] = key;
+			if (!value.is_empty()) result["value_type"] = value;
+		}
+	}
 	return result;
 }
 
@@ -71,14 +113,19 @@ static Dictionary reflected_method(const Dictionary &raw) {
 	Array defaults = raw.get("default_args", Array());
 	for (int i = 0; i < args.size(); i++) {
 		Dictionary arg = reflected_type(args[i]);
+		arg["index"] = i;
 		int d = i - (args.size() - defaults.size());
-		if (d >= 0) arg["default"] = plain_metadata(defaults[d]);
+		if (d >= 0) {
+			try { arg["default"] = ValueCodec().encode(defaults[d]); arg["default_status"] = "encoded"; }
+			catch (const ValueFailure &) { arg["default"] = Variant(); arg["default_status"] = "unavailable"; }
+		}
 		arguments.push_back(arg);
 	}
 	result["arguments"] = arguments;
 	int flags = raw.get("flags", 0);
 	result["is_const"] = bool(flags & METHOD_FLAG_CONST);
 	result["is_static"] = bool(flags & METHOD_FLAG_STATIC);
+	result["is_vararg"] = bool(flags & METHOD_FLAG_VARARG);
 	return result;
 }
 
@@ -300,7 +347,7 @@ bool ApiIndex::refresh() {
 		Dictionary &cache = property ? property_signatures : method_signatures;
 		String key = owner + String(":") + name;
 		if (cache.has(key)) return cache[key];
-		Dictionary sig;
+		Dictionary sig = member.duplicate();
 		bool script = String(cls.get("kind", "")) == "script_class";
 		String source = cls.get("source", "engine");
 		bool constant = member.get("is_const", false);
@@ -532,21 +579,19 @@ static String ts_type(const Variant &t) {
 	if (s.is_empty() || s == "void") {
 		return "void";
 	}
-	if (s == "int" || s == "float") {
-		return "number";
-	}
+	if (s == "Nil") return "null";
+	if (s == "int") return "GodotInt";
+	if (s == "float") return "GodotFloat";
+	for (int type = 0; type < Variant::VARIANT_MAX; type++) if (s == Variant::get_type_name((Variant::Type)type) && !ValueCodec::fields(type).empty()) return "Godot" + s + " | GodotValueReference<\"" + s + "\">";
+	if (s == "RID" || s == "Callable" || s == "Signal") return "GodotValueReference<\"" + s + "\">";
+	if (s.begins_with("Packed")) return "GodotPacked<\"" + s + "\">";
 	if (s == "bool") {
 		return "boolean";
 	}
-	if (s == "String" || s == "StringName" || s == "NodePath") {
-		return "string";
-	}
-	if (s.begins_with("Array") || s == "PackedStringArray") {
-		return "any[]";
-	}
-	if (s == "Dictionary") {
-		return "Record<string, any>";
-	}
+	if (s == "String") return "string";
+	if (s == "StringName" || s == "NodePath") return "string | { $t: \"" + s + "\"; value: string }";
+	if (s.begins_with("Array")) return "GodotArray";
+	if (s == "Dictionary") return "GodotDictionary";
 	if (s == "Variant") {
 		return "any";
 	}
@@ -558,12 +603,39 @@ bool ApiIndex::generate_dts(const String &path) const {
 	String out;
 	out += "// Generated by godot-cm from the permission-filtered API index. Do not edit.\n";
 	out += "declare type GodotHandle = { readonly __godotHandle: string; readonly class_name?: string; readonly script_class?: string };\n\n";
+	out += "declare interface GodotTypeDescriptor { type: string; variant_type?: number | null; class_name?: string; usage?: number; hint?: number; hint_string?: string; metadata_status?: string; element_type?: GodotTypeDescriptor; key_type?: GodotTypeDescriptor; value_type?: GodotTypeDescriptor; }\n";
+	out += R"TS(declare type GodotValueReference<T extends string = string> = { readonly __godotValue: string; readonly type: T };
+declare type GodotInt = number | bigint | { $t: "int"; value: string };
+declare type GodotFloat = number | { $t: "float"; value: number | "NaN" | "+Infinity" | "-Infinity" | "-0" };
+declare type GodotFiniteFloat = number | { $t: "float"; value: number | "-0" };
+declare type GodotArray<T = unknown> = T[] | { $t: "Array"; values: T[]; element_type?: GodotTypeDescriptor } | GodotValueReference<"Array">;
+declare type GodotDictionary = Record<string, unknown> | { $t: "Dictionary"; entries: { key: unknown; value: unknown }[]; key_type?: GodotTypeDescriptor; value_type?: GodotTypeDescriptor } | GodotValueReference<"Dictionary">;
+declare type GodotPacked<T extends string = string> = unknown[] | { $t: T; values: unknown[] } | GodotValueReference<T>;
+declare interface GodotTypeHelp extends GodotTypeDescriptor { category: string; contextual: boolean; opaque_only: boolean; fields: (GodotTypeDescriptor & { name: string; required: boolean; default?: unknown })[]; explicit_tag: string | null; contextual_format: string; explicit_format: string | null; output_format: string; positional_components: false; max_depth: number; inline_elements: number; inline_bytes: number; max_value_references: number; max_value_bytes: number; notes: string; reference_operations?: string; }
+declare interface GodotValueInfo { type: string; variant_type: number; size: number; readable: boolean; fields: string[]; accounted_bytes: number; retained_references: number; retained_accounted_bytes: number; reference_limit: number; accounted_byte_limit: number; }
+declare interface GodotValuePage { type: string; variant_type: number; offset: number; total: number; count: number; next_offset: number | null; truncated: boolean; items?: unknown[]; entries?: { key: unknown; value: unknown }[]; fields?: Record<string, unknown>; }
+declare interface GodotDiagnostic { code: string; message: string; phase: string; operation?: string; class?: string; member?: string; argument?: number; path?: string; expected?: string; received?: string; batch_index?: number; source?: { line?: number; column?: number; stack?: string; stack_truncated?: boolean }; omitted_characters?: number; }
+declare interface GodotExecutionResult { ok: boolean; result: unknown; diagnostics: GodotDiagnostic[]; changes: unknown[]; mode: "read" | "write" | "untracked"; rollback_supported: boolean; effects: { op: string; class: string; member: string; status: string; rollbackable: false }[]; partial: boolean; checkpoints: { name: string; value: unknown }[]; truncated: boolean; result_omitted?: boolean; effects_omitted?: number; changes_omitted?: number; diagnostics_omitted?: number; }
+declare function checkpoint(name: string, value: unknown): void;
+)TS";
+	for (int type = 0; type < Variant::VARIANT_MAX; type++) {
+		std::vector<ValueField> fields = ValueCodec::fields(type);
+		if (fields.empty()) continue;
+		String name = Variant::get_type_name((Variant::Type)type);
+		out += "declare interface Godot" + name + " { $t?: \"" + name + "\";";
+		for (const ValueField &field : fields) {
+			String field_type = field.type == Variant::FLOAT ? String("GodotFiniteFloat") : field.type == Variant::INT ? String("GodotInt") : "Godot" + Variant::get_type_name(field.type);
+			out += " " + String(field.name) + (field.optional ? "?" : "") + ": " + field_type + ";";
+		}
+		out += " }\n";
+	}
 	out += "declare namespace api {\n";
+	out += "\tfunction types(): GodotTypeHelp[];\n\tfunction describeType(name: string): GodotTypeHelp | undefined;\n";
 	out += "\tfunction classes(): { name: string; inherits: string; kind: string; source: string; path?: string; metadata_status?: string; singletons: string[]; construct_mode: string }[];\n";
 	out += "\tfunction describe(name: string): {\n";
 	out += "\t\tinherits: string;\n";
-	out += "\t\tmethods: { name: string; arguments: any[]; return: any }[];\n";
-	out += "\t\tproperties: { name: string; type: string }[];\n";
+	out += "\t\tmethods: { name: string; arguments: (GodotTypeDescriptor & { name: string; index: number; default?: unknown; default_status?: \"encoded\" | \"unavailable\" })[]; return: GodotTypeDescriptor; is_vararg: boolean; mode: string }[];\n";
+	out += "\t\tproperties: (GodotTypeDescriptor & { name: string; read_mode: string; write_mode: string })[];\n";
 	out += "\t} | undefined;\n";
 	out += "\tfunction find(query: string): string[];\n";
 	out += "}\n\n";
@@ -573,19 +645,20 @@ bool ApiIndex::generate_dts(const String &path) const {
 		String cls = names[i];
 		if (!cls.is_valid_identifier()) continue;
 		Dictionary e = index[cls];
-		out += "declare namespace " + cls + " {\n";
+		out += "declare interface GodotClass_" + cls + " {\n";
 		Array ms = e.get("methods", Array());
 		for (int m = 0; m < ms.size(); m++) {
 			Dictionary md = ms[m];
-			String sig = "\tfunction " + String(md.get("name", "")) + "(";
+			String sig = "\t" + JSON::stringify(String(md.get("name", ""))) + "(";
 			Array args = md.get("arguments", Array());
 			for (int a = 0; a < args.size(); a++) {
 				if (a) {
 					sig += ", ";
 				}
 				Dictionary ad = args[a];
-				sig += String(ad.get("name", "a" + String::num_int64(a))) + "?: " + ts_type(ad.get("type", "Variant"));
+				sig += "arg" + String::num_int64(a) + (ad.has("default") ? "?: " : ": ") + ts_type(ad.get("type", "Variant"));
 			}
+			if ((bool)md.get("is_vararg", false)) sig += (args.is_empty() ? String() : String(", ")) + "...extra: any[]";
 			Variant rv = md.get("return", Variant());
 			String ret = "void";
 			if (rv.get_type() == Variant::DICTIONARY) {
@@ -598,13 +671,14 @@ bool ApiIndex::generate_dts(const String &path) const {
 		Array ps = e.get("properties", Array());
 		for (int p = 0; p < ps.size(); p++) {
 			Dictionary pd = ps[p];
-			out += "\tconst " + String(pd.get("name", "")) + ": " + ts_type(pd.get("type", "Variant")) + ";\n";
+			out += "\treadonly " + JSON::stringify(String(pd.get("name", ""))) + ": " + ts_type(pd.get("type", "Variant")) + ";\n";
 		}
 		out += "}\n\n";
 	}
 
 	out += "declare namespace godot {\n";
 	out += "\tconst mode: \"read\" | \"write\" | \"untracked\";\n";
+	out += "\tnamespace values {\n\t\tfunction inspect(reference: GodotValueReference): Promise<GodotValueInfo>;\n\t\tfunction read(reference: GodotValueReference, options?: { offset?: number; limit?: number }): Promise<GodotValuePage>;\n\t\tfunction release(reference: GodotValueReference): Promise<{ released: true }>;\n\t}\n";
 	out += "\tfunction create(className: string, ...constructorArgs: any[]): Promise<GodotHandle>;\n";
 	out += "\tfunction getSingleton(name: string): Promise<GodotHandle>;\n";
 	out += "\tfunction get(handle: GodotHandle, prop: string): Promise<any>;\n";

@@ -4,6 +4,9 @@
 - Linux editor build: `cmake -B build -DGODOTCPP_TARGET=editor -DCMAKE_BUILD_TYPE=Release && cmake --build build -j 6`.
 - Windows x86-64 editor cross-build: `cmake -B build-windows -DCMAKE_TOOLCHAIN_FILE=toolchains/mingw-w64.cmake -DGODOTCPP_TARGET=editor -DCMAKE_BUILD_TYPE=Release && cmake --build build-windows -j 6`. Use a fresh build directory when switching toolchains. The toolchain statically links the MinGW runtime.
 - Generic MCP integration tests: `python3 tools/test_generic_bridge.py` (requires `godot` on PATH, or `--godot /path/to/godot`).
+- Regenerate the checked-in declarations with `python3 tools/test_generic_bridge.py --write-declarations`; typecheck with `npm exec --yes --package=typescript@5.8.3 -- tsc --noEmit --strict --target ES2020 addons/godot_cm/api-surface.d.ts`.
+- Isolated performance comparison: `python3 tools/test_generic_bridge.py --benchmark --baseline-021` then `python3 tools/test_generic_bridge.py --benchmark`. The baseline is extracted from the local v0.2.1 tag without checkout; see docs/benchmarks.md for its legacy batch-handle caveat.
+- Fast Variant inventory check: `python3 -B tools/test_generic_bridge.py --inventory-only`; checks all 39 fixture categories against the API dump and godot-cpp enum without launching the editor.
 - Optional real-extension/physics test: `python3 tools/test_generic_bridge.py --terrain-addon /path/to/project/addons/terrain_3d`.
 - Tests create isolated temporary projects and copy the optional third-party addon. Do not import or run tests against the user's example project: Godot may rewrite project settings and import metadata.
 - The isolated fixture seeds `.godot/extension_list.cfg` before initial import so native classes are available at editor startup.

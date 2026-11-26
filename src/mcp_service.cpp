@@ -24,7 +24,7 @@ namespace godot_cm {
 
 static const char *PROTOCOL_VERSION = "2025-11-25";
 static const char *SERVER_NAME = "godot-cm";
-static const char *SERVER_VERSION = "0.2.1";
+static const char *SERVER_VERSION = "0.3.0";
 
 void McpService::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("start", "port"), &McpService::start);
@@ -163,7 +163,7 @@ Variant McpService::handle_tools_list(const Variant &id) {
 
 	Dictionary search;
 	search["name"] = "search";
-	search["description"] = "Run read-only JS over a consistent snapshot of the runtime API catalog (api.classes/api.describe/api.find), including installed native extensions and project script classes. Uncached scripts have partial metadata; discovery never loads or instantiates them.";
+	search["description"] = "Run read-only JS over a consistent snapshot of the runtime API catalog (api.classes/api.describe/api.find), including installed native extensions and project script classes. api.types() lists all 39 Variant types; api.describeType(name) gives named/contextual and explicit $t formats, inline/opaque outputs, numeric limits and reference-only restrictions. Uncached scripts have partial metadata; discovery never loads or instantiates them. Declared type descriptors retain variant_type, class_name, hints, collection constraints and argument defaults. Variant/untyped metadata does not supply concrete conversion context. Discovering metadata does not authorize its execution.";
 	Dictionary search_schema;
 	search_schema["type"] = "object";
 	Dictionary search_props;
@@ -186,7 +186,17 @@ Variant McpService::handle_tools_list(const Variant &id) {
 			"Failures retain prior effects; inspect effects and partial before retrying. Denied classes/members and direct-use permission tiers remain enforced. "
 			"Use api.describe for signatures/constants, godot.create(className), godot.getSingleton(name), and godot.call(handleOrStaticClass, method, ...args). "
 			"Project constructors and custom script members require untracked mode; uncached project constructors also require filesystem permission. "
-			"Installed plugins require no adapters or core recompilation. requestTier/unlockedTiers manage per-session grants.";
+			"Installed plugins require no adapters or core recompilation. requestTier/unlockedTiers manage per-session grants. "
+			"Await godot operations (returning the top-level promise directly also works); nested promises are UNAWAITED_VALUE. "
+			"Named math objects convert only with a declared destination; Variant/untyped objects stay dictionaries, so use $t there. "
+			"Use api.types()/api.describeType() for all formats. Object handles and value references are not interchangeable. "
+			"Small collections are inline up to 256 elements/16 KiB; await godot.values.inspect/read for opaque values. "
+			"Release requires authorized untracked; quotas are 4096 references and 64 MiB accounted storage, with no silent eviction. "
+			"checkpoint(name,value) is synchronous: 32 ordered snapshots, 1..128 UTF-8 name bytes, 64 KiB encoded total, depth 32. "
+			"Checkpoints survive failure but are historical data/references, not locals recovery, current scene state or rollback guarantees. "
+			"Errors keep original codes, paths and available source locations; intrinsic Error.prepareStackTrace/stackTraceLimit are reserved. "
+			"The execution envelope is bounded to 256 KiB; truncated, result_omitted and *_omitted report omissions. "
+			"Invocation success is not proof of plugin-domain success.";
 	Dictionary exec_schema;
 	exec_schema["type"] = "object";
 	Dictionary exec_props;
