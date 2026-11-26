@@ -10,3 +10,5 @@
 - Scene construction, resource persistence, playback and runtime-result retrieval in the optional physics test use MCP. Its temporary observer script only samples a generic rigid body; it does not integrate Terrain3D.
 - Keep third-party implementations/adapters out of `src/` and `addons/godot_cm/`. Test-only plugin usage belongs in `tools/` or isolated fixtures.
 - Before finishing: rebuild both native binaries after source/version changes, run relevant integration tests, and run `git diff --check`. A successful Windows cross-build does not establish Windows runtime compatibility.
+- Activation tests exercise the shipped EditorPlugin, immediate disable/re-enable, pending/running status, occupied ports, and measure checkbox latency separately from service readiness. Startup discovers native APIs from ClassDB without parsing the static API dump; inherited signatures are shared within each immutable catalog.
+- Normal activation skips diagnostic spike checks and TypeScript generation. Opt in with `GODOT_CM_RUN_CHECKS=1` or `GODOT_CM_GENERATE_DTS=1` when developing; generated declarations are written to `user://godot_cm-api-surface.d.ts`.

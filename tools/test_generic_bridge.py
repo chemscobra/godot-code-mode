@@ -21,13 +21,53 @@ func _enter_tree() -> void:
     call_deferred("_start")
 
 func _start() -> void:
+    await _probe_activation()
     service = ClassDB.instantiate("McpService")
+    var started := Time.get_ticks_msec()
     assert(service.start(int(OS.get_environment("GENERIC_TEST_PORT"))))
+    FileAccess.open("res://startup_ms", FileAccess.WRITE).store_string(str(Time.get_ticks_msec() - started))
+    var occupied = ClassDB.instantiate("McpService")
+    started = Time.get_ticks_msec()
+    assert(not occupied.start(int(OS.get_environment("GENERIC_TEST_PORT"))))
+    FileAccess.open("res://busy_ms", FileAccess.WRITE).store_string(str(Time.get_ticks_msec() - started))
+    occupied = null
     service.tier_request.connect(_permission)
     service.set_tier_policy("untracked", "deny" if OS.get_environment("GENERIC_TEST_DENY") == "1" else "ask")
     service.set_tier_policy("filesystem", "ask")
     EditorInterface.open_scene_from_path("res://blank.tscn")
     FileAccess.open("res://ready", FileAccess.WRITE).store_string("ready")
+
+func _has_status(text: String) -> bool:
+    for label in EditorInterface.get_base_control().find_children("*", "Label", true, false):
+        if label.text == text:
+            return true
+    return false
+
+func _probe_activation() -> void:
+    var started := Time.get_ticks_msec()
+    EditorInterface.set_plugin_enabled("godot_cm", true)
+    var activation_ms := Time.get_ticks_msec() - started
+    assert(EditorInterface.is_plugin_enabled("godot_cm"))
+    assert(_has_status("Starting MCP server..."))
+    EditorInterface.set_plugin_enabled("godot_cm", false)
+    await get_tree().process_frame
+    await get_tree().process_frame
+    await get_tree().process_frame
+    assert(not _has_status("MCP server running"))
+    var probe := TCPServer.new()
+    assert(probe.listen(int(OS.get_environment("GENERIC_TEST_PORT")), "127.0.0.1") == OK)
+    probe.stop()
+    started = Time.get_ticks_msec()
+    EditorInterface.set_plugin_enabled("godot_cm", true)
+    activation_ms = maxi(activation_ms, Time.get_ticks_msec() - started)
+    assert(_has_status("Starting MCP server..."))
+    var deadline := Time.get_ticks_msec() + 15000
+    while not _has_status("MCP server running") and Time.get_ticks_msec() < deadline:
+        await get_tree().process_frame
+    assert(_has_status("MCP server running"))
+    var ready_ms := Time.get_ticks_msec() - started
+    EditorInterface.set_plugin_enabled("godot_cm", false)
+    FileAccess.open("res://activation_ms", FileAccess.WRITE).store_string(JSON.stringify({"checkbox": activation_ms, "ready": ready_ms}))
 
 func _permission(tier: String, _classes: Array) -> void:
     service.respond_tier_request(tier, true)
@@ -369,7 +409,7 @@ func _physics_process(delta: float) -> void:
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
-        env = dict(os.environ, GENERIC_TEST_PORT=str(port), GENERIC_TEST_DENY="1" if denied else "0")
+        env = dict(os.environ, GENERIC_TEST_PORT=str(port), GODOT_CM_PORT=str(port), GENERIC_TEST_DENY="1" if denied else "0", GODOT_CM_GENERATE_DTS="0")
         with (project / "editor.log").open("w+") as log:
             process = subprocess.Popen([args.godot, "--headless", "--editor", "--path", directory], env=env, stdout=log, stderr=subprocess.STDOUT)
             try:
@@ -379,7 +419,17 @@ func _physics_process(delta: float) -> void:
                         log.seek(0)
                         raise AssertionError(log.read())
                     time.sleep(0.1)
+                activation = json.loads((project / "activation_ms").read_text())
+                print(f"Addon activation: {activation['checkbox']} ms; MCP ready: {activation['ready']} ms", flush=True)
+                assert activation["checkbox"] < 1000, activation
+                busy_ms = int((project / "busy_ms").read_text())
+                assert busy_ms < 250, busy_ms
+                print(f"MCP service startup: {(project / 'startup_ms').read_text()} ms; occupied port: {busy_ms} ms", flush=True)
                 exercise(Client(port), project, denied, bool(args.terrain_addon))
+                log.flush()
+                log.seek(0)
+                output = log.read()
+                assert "SCRIPT ERROR:" not in output, output
             except BaseException:
                 log.flush()
                 log.seek(0)

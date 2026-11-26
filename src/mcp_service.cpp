@@ -11,6 +11,7 @@
 #include <godot_cpp/classes/gd_extension_manager.hpp>
 #include <godot_cpp/classes/file_access.hpp>
 #include <godot_cpp/classes/json.hpp>
+#include <godot_cpp/classes/os.hpp>
 #include <godot_cpp/classes/project_settings.hpp>
 #include <godot_cpp/classes/scene_tree.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
@@ -23,7 +24,7 @@ namespace godot_cm {
 
 static const char *PROTOCOL_VERSION = "2025-11-25";
 static const char *SERVER_NAME = "godot-cm";
-static const char *SERVER_VERSION = "0.2.0";
+static const char *SERVER_VERSION = "0.2.1";
 
 void McpService::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("start", "port"), &McpService::start);
@@ -347,10 +348,21 @@ bool McpService::start(int p_port) {
 	pending_execs.clear();
 
 	server = std::make_unique<httplib::Server>();
+	server->set_socket_options([](socket_t socket) {
+#ifdef _WIN32
+		httplib::detail::set_socket_opt(socket, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, 1);
+#else
+		httplib::detail::set_socket_opt(socket, SOL_SOCKET, SO_REUSEADDR, 1);
+#endif
+	});
+	if (!server->bind_to_port("127.0.0.1", p_port)) {
+		server.reset();
+		return false;
+	}
 
 	api_index = std::make_unique<ApiIndex>();
-	if (api_index->load("res://addons/godot_cm/extension_api.json",
-			    "res://addons/godot_cm/allowlist.json")) {
+	if (!api_index->load("res://addons/godot_cm/allowlist.json")) return false;
+	if (OS::get_singleton()->get_environment("GODOT_CM_GENERATE_DTS") == "1") {
 		api_index->generate_dts("user://godot_cm-api-surface.d.ts");
 	}
 
@@ -443,7 +455,7 @@ bool McpService::start(int p_port) {
 	port = p_port;
 	running.store(true);
 	server_thread = new std::thread([this]() {
-		if (!server->listen("127.0.0.1", port)) {
+		if (!server->listen_after_bind()) {
 			running.store(false);
 			UtilityFunctions::printerr("[godot-cm] MCP server failed to bind 127.0.0.1:", port);
 		}

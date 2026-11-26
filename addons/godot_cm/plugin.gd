@@ -8,6 +8,7 @@ var _runner: RefCounted
 var _service: RefCounted
 var _dock: HBoxContainer
 var _status: Label
+var _startup_generation := 0
 
 # Catppuccin Mocha palette
 const MOCHA := {
@@ -22,14 +23,25 @@ const MOCHA := {
 
 
 func _enter_tree() -> void:
-	_runner = SpikeRunner.new()
-	_runner.run_checks()
-	_service = McpService.new()
-
+	_startup_generation += 1
 	var base := int(OS.get_environment("GODOT_CM_PORT")) if OS.has_environment("GODOT_CM_PORT") else DEFAULT_PORT
 	if base <= 0 or base > 65535:
 		base = DEFAULT_PORT
+	_build_dock(-1, base)
+	_start_service(base, _startup_generation)
 
+
+func _start_service(base: int, generation: int) -> void:
+	await get_tree().process_frame
+	if not is_inside_tree() or generation != _startup_generation:
+		return
+	await get_tree().process_frame
+	if not is_inside_tree() or generation != _startup_generation:
+		return
+	if OS.get_environment("GODOT_CM_RUN_CHECKS") == "1":
+		_runner = SpikeRunner.new()
+		_runner.run_checks()
+	_service = McpService.new()
 	var port := base
 	while port <= base + MAX_PORT_TRIES:
 		if _service.start(port):
@@ -51,6 +63,7 @@ func _enter_tree() -> void:
 
 
 func _exit_tree() -> void:
+	_startup_generation += 1
 	if _dock != null:
 		remove_control_from_bottom_panel(_dock)
 		_dock.queue_free()
@@ -62,6 +75,9 @@ func _exit_tree() -> void:
 
 
 func _build_dock(port: int, base: int) -> void:
+	if _dock != null:
+		remove_control_from_bottom_panel(_dock)
+		_dock.queue_free()
 	_dock = HBoxContainer.new()
 	_dock.name = "Godot CM"
 	_dock.alignment = BoxContainer.ALIGNMENT_CENTER
@@ -105,6 +121,11 @@ func _build_dock(port: int, base: int) -> void:
 			copy_url.text = "Copied!"
 		)
 		header.add_child(copy_url)
+	elif port < 0:
+		dot.text = "..."
+		dot.add_theme_color_override("font_color", MOCHA.yellow)
+		_status.text = "Starting MCP server..."
+		_status.add_theme_color_override("font_color", MOCHA.yellow)
 	else:
 		dot.text = "●"
 		dot.add_theme_color_override("font_color", MOCHA.red)

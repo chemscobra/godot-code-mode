@@ -25,7 +25,6 @@ public:
 };
 
 class ApiIndex : public ApiCatalog {
-	godot::Dictionary api_document;
 	godot::Dictionary policy_document;
 	godot::Dictionary observed_scripts;
 	uint64_t revision = 0;
@@ -39,7 +38,7 @@ class ApiIndex : public ApiCatalog {
 	bool dirty = true;
 
 public:
-	bool load(const godot::String &extension_api_path, const godot::String &allowlist_path);
+	bool load(const godot::String &allowlist_path);
 	bool is_loaded() const { return loaded; }
 	bool refresh();
 	void invalidate() { dirty = true; }

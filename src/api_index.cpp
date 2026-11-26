@@ -103,14 +103,12 @@ std::shared_ptr<const ApiCatalog> ApiIndex::snapshot() const {
 	return catalog;
 }
 
-bool ApiIndex::load(const String &api_path, const String &allowlist_path) {
-	Variant api_v = parse_json_file(api_path);
+bool ApiIndex::load(const String &allowlist_path) {
 	Variant allow_v = parse_json_file(allowlist_path);
-	if (api_v.get_type() != Variant::DICTIONARY || allow_v.get_type() != Variant::DICTIONARY) {
+	if (allow_v.get_type() != Variant::DICTIONARY) {
 		UtilityFunctions::printerr("[godot-cm] failed to load api index or allowlist");
 		return false;
 	}
-	api_document = api_v;
 	policy_document = allow_v;
 	loaded = false;
 	return refresh();
@@ -166,12 +164,8 @@ bool ApiIndex::refresh() {
 	Dictionary cfg = policy_document;
 	bool deny_mode = String(cfg.get("mode", "")) == "denylist";
 	Dictionary allow = cfg.get("classes", Dictionary());
-	Array api_classes = api_document.get("classes", Array());
-	Array api_singletons = api_document.get("singletons", Array());
 	// EditorInterface etc. live under "singletons" or "classes" depending on the dump.
 	Array all;
-	for (int i = 0; i < api_classes.size(); i++) all.push_back(api_classes[i]);
-	for (int i = 0; i < api_singletons.size(); i++) all.push_back(api_singletons[i]);
 	Dictionary aliases;
 	for (const String &name : singleton_names) {
 		Object *object = Engine::get_singleton()->get_singleton(name);
@@ -184,6 +178,21 @@ bool ApiIndex::refresh() {
 	Array editor_alias;
 	editor_alias.push_back("EditorInterface");
 	aliases["EditorInterface"] = editor_alias;
+	Dictionary declared_methods;
+	Dictionary method_flags;
+	auto methods_for = [&](const String &name) -> Array {
+		if (!declared_methods.has(name)) {
+			Array methods = cdb->class_get_method_list(name, true);
+			Dictionary flags;
+			for (const Variant &method : methods) {
+				Dictionary info = method;
+				flags[info.get("name", "")] = info.get("flags", 0);
+			}
+			declared_methods[name] = methods;
+			method_flags[name] = flags;
+		}
+		return declared_methods[name];
+	};
 	for (const String &name : native_names) {
 		Dictionary cls;
 		cls["name"] = name;
@@ -193,22 +202,24 @@ bool ApiIndex::refresh() {
 		auto api_type = cdb->class_get_api_type(name);
 		cls["source"] = api_type == ClassDBSingleton::API_EXTENSION || api_type == ClassDBSingleton::API_EDITOR_EXTENSION ? "extension" : "engine";
 		Array methods;
-		for (const Variant &method : cdb->class_get_method_list(name, true)) methods.push_back(reflected_method(method));
+		for (const Variant &method : methods_for(name)) methods.push_back(reflected_method(method));
 		cls["methods"] = methods;
 		Array properties;
-		Array inherited_methods = cdb->class_get_method_list(name);
 		for (const Variant &property : cdb->class_get_property_list(name, true)) {
 			Dictionary raw = property;
 			if ((int)raw.get("usage", 0) & (PROPERTY_USAGE_GROUP | PROPERTY_USAGE_CATEGORY | PROPERTY_USAGE_SUBGROUP)) continue;
 			Dictionary property_info = reflected_type(raw);
 			String getter = cdb->class_get_property_getter(name, raw.get("name", ""));
 			property_info["is_const"] = false;
-			for (const Variant &method : inherited_methods) {
-				Dictionary info = method;
-				if (String(info.get("name", "")) == getter) {
-					property_info["is_const"] = bool((int)info.get("flags", 0) & METHOD_FLAG_CONST);
+			String owner = name;
+			for (int guard = 0; !getter.is_empty() && !owner.is_empty() && guard < 64; guard++) {
+				methods_for(owner);
+				Dictionary flags = method_flags[owner];
+				if (flags.has(getter)) {
+					property_info["is_const"] = bool((int)flags[getter] & METHOD_FLAG_CONST);
 					break;
 				}
+				owner = cdb->get_parent_class(owner);
 			}
 			properties.push_back(property_info);
 		}
@@ -283,6 +294,34 @@ bool ApiIndex::refresh() {
 	untracked_notice.push_back("Native and project-script execution without undo or rollback; code may have arbitrary side effects, including file and network access.");
 	tier_classes["untracked"] = untracked_notice;
 
+	Dictionary method_signatures, property_signatures;
+	auto signature_for = [&](const String &owner, const Dictionary &cls, const Dictionary &member, bool property) -> Dictionary {
+		String name = member.get("name", "");
+		Dictionary &cache = property ? property_signatures : method_signatures;
+		String key = owner + String(":") + name;
+		if (cache.has(key)) return cache[key];
+		Dictionary sig;
+		bool script = String(cls.get("kind", "")) == "script_class";
+		String source = cls.get("source", "engine");
+		bool constant = member.get("is_const", false);
+		sig["name"] = name;
+		sig["script"] = script;
+		sig["source"] = source;
+		sig["is_const"] = constant;
+		if (property) {
+			sig["type"] = member.get("type", "");
+			sig["read_mode"] = constant && !script ? "read" : "untracked";
+			sig["write_mode"] = source == "engine" ? "write" : "untracked";
+		} else {
+			sig["return"] = member.get("return_value", member.get("return_type", Variant()));
+			sig["arguments"] = member.get("arguments", Array());
+			sig["is_static"] = member.get("is_static", false);
+			sig["owner"] = owner;
+			sig["mode"] = constant && !script ? "read" : source == "engine" && reversible_method(owner, name) ? "write" : "untracked";
+		}
+		cache[key] = sig;
+		return sig;
+	};
 	index = Dictionary();
 	for (int i = 0; i < all.size(); i++) {
 		Dictionary cls = all[i];
@@ -358,17 +397,7 @@ bool ApiIndex::refresh() {
 			if (deny_global.has(mname) || cls_deny.has(mname)) {
 				continue;
 			}
-			Dictionary sig;
-			sig["name"] = mname;
-			sig["return"] = md.get("return_value", md.get("return_type", Variant()));
-			sig["arguments"] = md.get("arguments", Array());
-			sig["is_const"] = md.get("is_const", false);
-			sig["is_static"] = md.get("is_static", false);
-			sig["script"] = String(cls.get("kind", "")) == "script_class";
-			sig["owner"] = name;
-			sig["source"] = cls.get("source", "engine");
-			sig["mode"] = (bool)sig["is_const"] && !(bool)sig["script"] ? "read" : String(sig["source"]) == "engine" && reversible_method(name, mname) ? "write" : "untracked";
-			methods.push_back(sig);
+			methods.push_back(signature_for(name, cls, md, false));
 		}
 		entry["methods"] = methods;
 
@@ -390,15 +419,7 @@ bool ApiIndex::refresh() {
 			if (deny_global.has(pname) || cls_deny.has(pname)) {
 				continue;
 			}
-			Dictionary sig;
-			sig["name"] = pname;
-			sig["type"] = pd.get("type", "");
-			sig["script"] = String(cls.get("kind", "")) == "script_class";
-			sig["source"] = cls.get("source", "engine");
-			sig["is_const"] = pd.get("is_const", false);
-			sig["read_mode"] = (bool)sig["is_const"] && !(bool)sig["script"] ? "read" : "untracked";
-			sig["write_mode"] = String(sig["source"]) == "engine" ? "write" : "untracked";
-			props.push_back(sig);
+			props.push_back(signature_for(name, cls, pd, true));
 		}
 		entry["properties"] = props;
 
@@ -416,17 +437,7 @@ bool ApiIndex::refresh() {
 						if (deny_global.has(bmname) || cls_deny.has(bmname)) {
 							continue;
 						}
-						Dictionary sig;
-						sig["name"] = md.get("name", "");
-						sig["return"] = md.get("return_value", md.get("return_type", Variant()));
-						sig["arguments"] = md.get("arguments", Array());
-						sig["is_const"] = md.get("is_const", false);
-						sig["is_static"] = md.get("is_static", false);
-						sig["script"] = String(b.get("kind", "")) == "script_class";
-						sig["owner"] = base;
-						sig["source"] = b.get("source", "engine");
-						sig["mode"] = (bool)sig["is_const"] && !(bool)sig["script"] ? "read" : String(sig["source"]) == "engine" && reversible_method(base, bmname) ? "write" : "untracked";
-						methods.push_back(sig);
+						methods.push_back(signature_for(base, b, md, false));
 					}
 				}
 				if (all_props) {
@@ -441,15 +452,7 @@ bool ApiIndex::refresh() {
 						if (deny_global.has(bpname) || cls_deny.has(bpname)) {
 							continue;
 						}
-						Dictionary sig;
-						sig["name"] = pd.get("name", "");
-						sig["type"] = pd.get("type", "");
-						sig["script"] = String(b.get("kind", "")) == "script_class";
-						sig["source"] = b.get("source", "engine");
-						sig["is_const"] = pd.get("is_const", false);
-						sig["read_mode"] = (bool)sig["is_const"] && !(bool)sig["script"] ? "read" : "untracked";
-						sig["write_mode"] = String(sig["source"]) == "engine" ? "write" : "untracked";
-						props.push_back(sig);
+						props.push_back(signature_for(base, b, pd, true));
 					}
 				}
 				base = b.get("inherits", "");
