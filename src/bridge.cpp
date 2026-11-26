@@ -10,6 +10,8 @@
 #include <godot_cpp/classes/ref_counted.hpp>
 #include <godot_cpp/classes/os.hpp>
 #include <godot_cpp/classes/scene_tree.hpp>
+#include <godot_cpp/classes/resource_loader.hpp>
+#include <godot_cpp/classes/script.hpp>
 #include <godot_cpp/classes/time.hpp>
 #include <godot_cpp/variant/callable.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
@@ -20,17 +22,35 @@ namespace godot_cm {
 
 void BridgePump::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("pump"), &BridgePump::pump);
+	ClassDB::bind_method(D_METHOD("invalidate_catalog"), &BridgePump::invalidate_catalog);
+}
+
+void BridgePump::invalidate_catalog() {
+	if (bridge && bridge->index) bridge->index->invalidate();
 }
 
 void BridgePump::pump() {
 	if (bridge) {
 		bridge->drain();
+		uint64_t now = Time::get_singleton()->get_ticks_msec();
+		if (bridge->index && now - last_catalog_refresh >= 100) {
+			bridge->index->refresh();
+			last_catalog_refresh = now;
+		}
 	}
 }
 
 uint64_t Bridge::mint_handle(Object *obj) {
+	uint64_t oid = obj->get_instance_id();
+	auto existing = object_handles.find(oid);
+	if (existing != object_handles.end()) return existing->second;
 	uint64_t id = next_handle++;
 	handles[id] = obj->get_instance_id();
+	object_handles[oid] = id;
+	if (index) {
+		index->observe_script(obj);
+		if (!index->script_class(obj).is_empty()) index->refresh();
+	}
 	return id;
 }
 
@@ -67,17 +87,37 @@ static BridgeResult op_value(const Variant &v) {
 	return r;
 }
 
+static BridgeResult invoke_checked(Object *target, const StringName &method, const Array &args) {
+	std::vector<const Variant *> pointers;
+	for (int i = 0; i < args.size(); i++) pointers.push_back(&args[i]);
+	Variant receiver(target), value;
+	GDExtensionCallError error{};
+	receiver.callp(method, pointers.data(), (int)pointers.size(), value, error);
+	BridgeResult result = error.error == GDEXTENSION_CALL_OK ? op_value(value)
+			: op_error("CALL_FAILED", String(method) + ": call error " + itos(error.error) + ", argument " + itos(error.argument));
+	result.dispatched = true;
+	return result;
+}
+
 // Convert a Variant result into wire form: objects become handle dicts,
 // arrays and dictionaries are converted recursively.
 Variant Bridge::to_wire(const Variant &v) {
 	if (v.get_type() == Variant::OBJECT) {
-		Object *obj = v;
+		Object *obj = v.get_validated_object();
 		if (obj == nullptr) {
 			return Variant();
+		}
+		if (object_handles.find((uint64_t)obj->get_instance_id()) == object_handles.end()) {
+			if (Object::cast_to<RefCounted>(obj)) retained_rc.push_back(Ref<RefCounted>(v));
 		}
 		uint64_t id = mint_handle(obj);
 		Dictionary h;
 		h["__godotHandle"] = "h" + String::num_uint64(id);
+		h["class_name"] = obj->get_class();
+		if (index) {
+			String script = index->script_class(obj);
+			if (!script.is_empty()) h["script_class"] = script;
+		}
 		return h;
 	}
 	if (v.get_type() == Variant::ARRAY) {
@@ -96,6 +136,30 @@ Variant Bridge::to_wire(const Variant &v) {
 		}
 		return out;
 	}
+	if (v.get_type() == Variant::VECTOR2 || v.get_type() == Variant::VECTOR3 || v.get_type() == Variant::COLOR) {
+		Dictionary tagged;
+		tagged["$t"] = Variant::get_type_name(v.get_type());
+		if (v.get_type() == Variant::VECTOR2) {
+			Vector2 point = v;
+			tagged["x"] = point.x; tagged["y"] = point.y;
+		} else if (v.get_type() == Variant::VECTOR3) {
+			Vector3 point = v;
+			tagged["x"] = point.x; tagged["y"] = point.y; tagged["z"] = point.z;
+		} else {
+			Color color = v;
+			tagged["r"] = color.r; tagged["g"] = color.g; tagged["b"] = color.b; tagged["a"] = color.a;
+		}
+		return tagged;
+	}
+	if (v.get_type() > Variant::STRING) {
+		if (v.get_type() == Variant::STRING_NAME || v.get_type() == Variant::NODE_PATH) return String(v);
+		uint64_t id = next_value++;
+		values[id] = v;
+		Dictionary value;
+		value["__godotValue"] = "v" + itos(id);
+		value["type"] = Variant::get_type_name(v.get_type());
+		return value;
+	}
 	return v;
 }
 
@@ -112,9 +176,15 @@ static Object *resolve_handle(const std::unordered_map<uint64_t, ObjectID> &hand
 // Also accepts the wire form {"__godotHandle":"hN"} — handle objects
 // nested inside arrays reach the bridge as wire dicts via the JSON
 // round-trip instead of the "$handle" arg form.
-static Variant unwrap_arg(const std::unordered_map<uint64_t, ObjectID> &handles, const Variant &v) {
+static Variant unwrap_arg(const std::unordered_map<uint64_t, ObjectID> &handles, const std::unordered_map<uint64_t, Variant> &values, const Variant &v) {
 	if (v.get_type() == Variant::DICTIONARY) {
 		Dictionary d = v;
+		if (d.has("__godotValue")) {
+			String name = d["__godotValue"];
+			uint64_t id = name.begins_with("v") ? (uint64_t)name.substr(1).to_int() : 0;
+			auto found = values.find(id);
+			return found == values.end() ? Variant() : found->second;
+		}
 		if (d.has("$handle")) {
 			uint64_t hid = (uint64_t)d["$handle"];
 			Object *obj = resolve_handle(handles, hid);
@@ -128,7 +198,7 @@ static Variant unwrap_arg(const std::unordered_map<uint64_t, ObjectID> &handles,
 		}
 		Dictionary out;
 		for (const Variant &k : d.keys()) {
-			out[k] = unwrap_arg(handles, d[k]);
+			out[k] = unwrap_arg(handles, values, d[k]);
 		}
 		return out;
 	}
@@ -136,7 +206,7 @@ static Variant unwrap_arg(const std::unordered_map<uint64_t, ObjectID> &handles,
 		Array a = v;
 		Array out;
 		for (int i = 0; i < a.size(); i++) {
-			out.push_back(unwrap_arg(handles, a[i]));
+			out.push_back(unwrap_arg(handles, values, a[i]));
 		}
 		return out;
 	}
@@ -147,17 +217,15 @@ static Variant unwrap_arg(const std::unordered_map<uint64_t, ObjectID> &handles,
 // object's own class entry is the complete grant set for it. (Walk a few
 // native ancestors too: a non-indexed intermediate class shouldn't hide
 // members granted by its bases.)
-static bool member_authorized(ApiIndex *index, Object *obj, const String &member) {
-	if (index == nullptr || obj == nullptr) {
-		return false;
-	}
-	ClassDBSingleton *cdb = ClassDBSingleton::get_singleton();
-	String cls = obj->get_class();
-	for (int guard = 0; !cls.is_empty() && guard < 64; guard++) {
-		if (index->member_allowed(cls, member)) {
-			return true;
+static bool member_authorized(ApiIndex *index, Object *obj, const String &member, bool property = false) {
+	if (!index || !obj || !index->class_allowed(obj->get_class())) return false;
+	for (const String &cls : {String(obj->get_class()), index->script_class(obj)}) {
+		if (!index->class_allowed(cls)) continue;
+		Dictionary entry = index->describe(cls);
+		Array members = entry.get(property ? "properties" : "methods", Array());
+		for (const Variant &item : members) {
+			if (String(((Dictionary)item).get("name", "")) == member) return true;
 		}
-		cls = cdb->get_parent_class(cls);
 	}
 	return false;
 }
@@ -214,7 +282,7 @@ static Dictionary simple_op(const char *k, uint64_t oid) {
 }
 
 static void journal(TxState *tx, const Dictionary &fwd, const Dictionary &inv) {
-	if (!tx) {
+	if (!tx || tx->untracked) {
 		return;
 	}
 	Dictionary e;
@@ -373,8 +441,58 @@ BridgeResult Bridge::finish_tx(const std::shared_ptr<TxState> &tx, bool commit) 
 	return op_value(Variant());
 }
 
-BridgeResult Bridge::execute_op(const BridgeOp &op, const std::shared_ptr<TxState> &tx) {
+BridgeResult Bridge::execute_op(const BridgeOp &incoming, const std::shared_ptr<TxState> &tx) {
+	BridgeOp op = incoming;
+	String kind = op.kind.c_str();
+	Object *target = resolve_handle(handles, op.target);
+	if (kind == "create" || kind == "set" || kind == "connect" || kind == "disconnect" || kind == "save_scene" || kind == "unlock_writes") op.write = true;
+	if (index && (target || kind == "create" || kind == "call" || kind == "singleton")) {
+		if (target) index->observe_script(target);
+		index->refresh();
+	}
+	if ((kind == "get" || kind == "set" || (kind == "call" && op.class_name.empty())) && !target) return op_error("INVALID_HANDLE", "handle expired or unknown");
+	if (target && (kind == "get" || kind == "set" || kind == "call") && !member_authorized(index, target, op.member.c_str(), kind != "call")) return op_error("PERMISSION", member_denied_msg(index, target, kind, op.member.c_str()));
+	if (kind == "call" && !op.class_name.empty() && (!index || !index->member_allowed(op.class_name.c_str(), op.member.c_str()))) return op_error("PERMISSION", "static member not allowed or class tier locked");
+	if (index && target && (kind == "get" || kind == "set")) {
+		Dictionary property = index->member_info(target->get_class(), op.member.c_str(), true);
+		bool unknown = kind == "get" ? !(bool)property.get("is_const", false) : !index->property_reversible(target->get_class(), op.member.c_str());
+		if (unknown) {
+			op.write = true;
+			if (!op.untracked) return op_error("UNTRACKED_REQUIRED", "unknown property accessor effects require mode untracked");
+		}
+	}
+	bool scripted = index && target && index->member_declared(index->script_class(target), op.member.c_str());
+	if (kind == "call") {
+		String cls = target ? String(target->get_class()) : String(op.class_name.c_str());
+		op.write = scripted || !index || !index->method_is_const(cls, op.member.c_str());
+	}
+	if (scripted && (kind == "get" || kind == "set" || kind == "call")) {
+		op.write = true;
+		if (!op.untracked) return op_error("UNTRACKED_REQUIRED", "project script access requires mode untracked and explicit permission");
+	}
+	if (op.write && !op.write_mode) return op_error("PERMISSION", "mutating operation in read mode");
+	if (op.write && op.untracked && (!index || !index->tier_unlocked("untracked"))) {
+		return op_error("PERMISSION", "request tier untracked before executing without rollback");
+	}
+	String effect_class = target ? String(target->get_class()) : String(op.class_name.c_str());
+	if (op.write && kind != "unlock_writes" && write_locked.load()) return op_error("TX_LOCKED", "writes locked pending review");
+	BridgeResult result = dispatch_op(op, tx);
+	result.write = op.write;
+	if (op.untracked && op.write && tx && (result.ok || result.dispatched)) {
+		Dictionary effect;
+		effect["op"] = kind;
+		effect["class"] = effect_class;
+		effect["member"] = op.member.c_str();
+		effect["status"] = result.ok ? "completed" : "failed";
+		effect["rollbackable"] = false;
+		tx->effects.push_back(effect);
+	}
+	return result;
+}
+
+BridgeResult Bridge::dispatch_op(const BridgeOp &op, const std::shared_ptr<TxState> &tx) {
 	const String kind = op.kind.c_str();
+	if (kind == "barrier") return op_value(Variant());
 
 	if (kind == "tx_commit") {
 		return finish_tx(tx, true);
@@ -398,6 +516,8 @@ BridgeResult Bridge::execute_op(const BridgeOp &op, const std::shared_ptr<TxStat
 	}
 
 	if (kind == "save_scene") {
+		if (!op.untracked) return op_error("UNTRACKED_REQUIRED", "saving is not undoable; use mode untracked");
+		if (!index || !index->tier_unlocked("filesystem")) return op_error("PERMISSION", "saving requires filesystem permission");
 		EditorInterface *ei = EditorInterface::get_singleton();
 		if (ei == nullptr) {
 			return op_error("NO_EDITOR", "EditorInterface unavailable");
@@ -412,7 +532,7 @@ BridgeResult Bridge::execute_op(const BridgeOp &op, const std::shared_ptr<TxStat
 		if (write_locked.load()) {
 			return op_error("TX_LOCKED", "writes locked: prior rollback left partial state");
 		}
-		if (tx) {
+		if (tx && !tx->untracked) {
 			EditorInterface *ei = EditorInterface::get_singleton();
 			EditorUndoRedoManager *ur = ei ? ei->get_editor_undo_redo() : nullptr;
 			if (ur) {
@@ -446,7 +566,9 @@ BridgeResult Bridge::execute_op(const BridgeOp &op, const std::shared_ptr<TxStat
 			sub.member = String(el.get("member", "")).utf8().get_data();
 			sub.args = el.get("args", Array());
 			sub.write = el.get("write", false);
-			if (sub.kind.empty() || sub.kind == "batch") {
+			sub.write_mode = op.write_mode;
+			sub.untracked = op.untracked;
+			if (sub.kind != "create" && sub.kind != "get" && sub.kind != "set" && sub.kind != "call" && sub.kind != "connect" && sub.kind != "disconnect" && sub.kind != "singleton") {
 				r = op_error("BAD_OP", "invalid or nested batch element");
 			} else if (sub.write && !op.write_mode) {
 				r = op_error("PERMISSION", "write op in read mode");
@@ -457,7 +579,7 @@ BridgeResult Bridge::execute_op(const BridgeOp &op, const std::shared_ptr<TxStat
 					wd["element"] = i;
 					warns.push_back(wd);
 				}
-				if (r.ok && sub.write && tx) {
+				if (r.ok && r.write && tx && !tx->untracked) {
 					Dictionary ch;
 					ch["op"] = ek;
 					ch["member"] = sub.member.c_str();
@@ -489,6 +611,44 @@ BridgeResult Bridge::execute_op(const BridgeOp &op, const std::shared_ptr<TxStat
 		return op_value(to_wire(Variant(ei->get_edited_scene_root())));
 	}
 
+	if (kind == "singleton") {
+		String cls = op.class_name.c_str();
+		Object *object = cls == "EditorInterface" ? EditorInterface::get_singleton()
+				: Engine::get_singleton()->has_singleton(cls) ? Engine::get_singleton()->get_singleton(cls) : nullptr;
+		if (!object) return op_error("NOT_FOUND", "singleton unavailable: " + cls);
+		if (!index || !index->class_allowed(object->get_class())) return op_error("PERMISSION", "singleton not allowed or class tier locked: " + cls);
+		return op_value(to_wire(object));
+	}
+
+	if (kind == "call" && !op.class_name.empty()) {
+		String cls = op.class_name.c_str(), method = op.member.c_str();
+		if (!index || !index->member_allowed(cls, method)) return op_error("PERMISSION", "static method not allowed: " + cls + "." + method);
+		Dictionary entry = index->describe(cls);
+		bool is_static = false;
+		for (const Variant &item : (Array)entry.get("methods", Array())) {
+			Dictionary info = item;
+			if (String(info.get("name", "")) == method) { is_static = info.get("is_static", false); break; }
+		}
+		if (!is_static) return op_error("NOT_STATIC", "use an instance handle or getSingleton for this method");
+		if (op.write && !op.untracked) return op_error("NO_UNDO", "static calls without an inverse require mode untracked");
+		bool project_class = String(entry.get("kind", "")) == "script_class";
+		Array args;
+		if (!project_class) { args.push_back(cls); args.push_back(method); }
+		for (const Variant &arg : op.args) args.push_back(unwrap_arg(handles, values, arg));
+		Ref<Script> script;
+		if (project_class) {
+			String path = entry.get("path", "");
+			ResourceLoader *loader = ResourceLoader::get_singleton();
+			if (!path.begins_with("res://") || path.simplify_path() != path || path.contains("\\")) return op_error("BAD_PATH", "invalid project class path");
+			if (!loader->has_cached(path) && !index->tier_unlocked("filesystem")) return op_error("PERMISSION", "loading a project class requires filesystem permission");
+			script = loader->has_cached(path) ? loader->get_cached_ref(path) : loader->load(path);
+			if (script.is_null()) return op_error("LOAD_FAILED", "could not load project class");
+		}
+		BridgeResult result = project_class ? invoke_checked(script.ptr(), method, args) : invoke_checked(ClassDBSingleton::get_singleton(), "class_call_static", args);
+		if (result.ok) result.value = to_wire(result.value);
+		return result;
+	}
+
 	if (kind == "create") {
 		String cls = op.class_name.c_str();
 		if (!index || !index->class_allowed(cls)) {
@@ -502,14 +662,33 @@ BridgeResult Bridge::execute_op(const BridgeOp &op, const std::shared_ptr<TxStat
 			return op_error("PERMISSION", msg);
 		}
 		ClassDBSingleton *cdb = ClassDBSingleton::get_singleton();
-		if (!cdb->can_instantiate(cls)) {
+		Dictionary entry = index->describe(cls);
+		bool project_class = String(entry.get("kind", "")) == "script_class";
+		if ((project_class || String(entry.get("source", "")) != "engine") && !op.untracked) return op_error("UNTRACKED_REQUIRED", "plugin and project constructors require mode untracked");
+		if (!project_class && !op.args.is_empty()) return op_error("BAD_ARGS", "native ClassDB constructors take no arguments; use a static factory");
+		if (!project_class && !cdb->can_instantiate(cls)) {
 			return op_error("NOT_INSTANTIABLE", "cannot instantiate: " + cls);
 		}
 		// NB: instantiate() returns a Variant — for RefCounted classes the
 		// ONLY valid lifetime is that Variant's ref. Casting it straight to
 		// Object* loses the engine binding (observed: oid=0 wrapper that
 		// crashes on any engine call).
-		Variant created = cdb->instantiate(cls);
+		Variant created;
+		if (project_class) {
+			String path = entry.get("path", "");
+			if (!path.begins_with("res://") || path.simplify_path() != path || path.contains("\\")) return op_error("BAD_PATH", "invalid project class path");
+			ResourceLoader *loader = ResourceLoader::get_singleton();
+			if (!loader->has_cached(path) && !index->tier_unlocked("filesystem")) return op_error("PERMISSION", "loading an uncached project class requires filesystem permission");
+			Ref<Script> script(loader->has_cached(path) ? loader->get_cached_ref(path) : loader->load(path));
+			if (script.is_null()) return op_error("LOAD_FAILED", "project script could not be loaded");
+			Array constructor_args;
+			for (const Variant &arg : op.args) constructor_args.push_back(unwrap_arg(handles, values, arg));
+			BridgeResult result = invoke_checked(script.ptr(), "new", constructor_args);
+			if (!result.ok) return result;
+			created = result.value;
+		} else {
+			created = cdb->instantiate(cls);
+		}
 		Object *obj = created.get_type() == Variant::OBJECT
 				? created.get_validated_object() : nullptr;
 		if (obj == nullptr) {
@@ -518,16 +697,20 @@ BridgeResult Bridge::execute_op(const BridgeOp &op, const std::shared_ptr<TxStat
 		// RefCounted results keep the Variant ref itself (correct refcount
 		// semantics); plain Objects (nodes) are tracked for cleanup if
 		// never adopted into the tree.
-		if (cdb->is_parent_class(cls, "RefCounted")) {
+		if (Object::cast_to<RefCounted>(obj)) {
 			retained_rc.push_back(Ref<RefCounted>(created));
 		} else {
 			retained_nodes.push_back(created);
 		}
 		uint64_t oid = (uint64_t)obj->get_instance_id();
+		if (Node *node = Object::cast_to<Node>(obj); node && String(node->get_name()).is_empty()) node->set_name(String(obj->get_class()) + "_" + itos(oid));
 		journal(tx.get(), simple_op("ref", oid), simple_op("free", oid));
 		uint64_t hid = mint_handle(obj);
 		Dictionary wire;
 		wire["__godotHandle"] = "h" + String::num_uint64(hid);
+		wire["class_name"] = obj->get_class();
+		String script_class = index->script_class(obj);
+		if (!script_class.is_empty()) wire["script_class"] = script_class;
 		return op_value(wire);
 	}
 
@@ -544,7 +727,7 @@ BridgeResult Bridge::execute_op(const BridgeOp &op, const std::shared_ptr<TxStat
 		StringName sig = StringName(String(op.member.c_str()));
 		Object *to = nullptr;
 		if (op.args.size() > 0) {
-			Variant tov = unwrap_arg(handles, op.args[0]);
+			Variant tov = unwrap_arg(handles, values, op.args[0]);
 			to = tov.get_type() == Variant::OBJECT ? (Object *)tov : nullptr;
 		}
 		if (to == nullptr) {
@@ -552,6 +735,9 @@ BridgeResult Bridge::execute_op(const BridgeOp &op, const std::shared_ptr<TxStat
 		}
 		StringName method = op.args.size() > 1
 				? StringName(String(op.args[1])) : StringName();
+		if (index) { index->observe_script(to); index->refresh(); }
+		if (!index || !index->class_allowed(target->get_class()) || !member_authorized(index, to, method)) return op_error("PERMISSION", "signal source or callback is not authorized");
+		if (kind == "connect" && !op.untracked && (!index->method_is_const(to->get_class(), method) || index->member_declared(index->script_class(to), method))) return op_error("UNTRACKED_REQUIRED", "callbacks with unknown effects require mode untracked");
 		Callable cb(to, method);
 		if (kind == "connect") {
 			if (!target->has_signal(sig)) {
@@ -561,7 +747,7 @@ BridgeResult Bridge::execute_op(const BridgeOp &op, const std::shared_ptr<TxStat
 			if (op.args.size() > 3) {
 				Array binds = op.args[3];
 				for (int b = 0; b < binds.size(); b++) {
-					binds[b] = unwrap_arg(handles, binds[b]);
+					binds[b] = unwrap_arg(handles, values, binds[b]);
 				}
 				if (!binds.is_empty()) {
 					cb = cb.bindv(binds);
@@ -596,7 +782,7 @@ BridgeResult Bridge::execute_op(const BridgeOp &op, const std::shared_ptr<TxStat
 
 	if (kind == "get") {
 		String prop = op.member.c_str();
-		if (!member_authorized(index, target, prop)) {
+		if (!member_authorized(index, target, prop, true)) {
 			return op_error("PERMISSION", member_denied_msg(index, target, "property", prop));
 		}
 		Variant v = target->get(prop);
@@ -605,10 +791,10 @@ BridgeResult Bridge::execute_op(const BridgeOp &op, const std::shared_ptr<TxStat
 
 	if (kind == "set") {
 		String prop = op.member.c_str();
-		if (!member_authorized(index, target, prop)) {
+		if (!member_authorized(index, target, prop, true)) {
 			return op_error("PERMISSION", member_denied_msg(index, target, "property", prop));
 		}
-		Variant arg = op.args.size() > 0 ? unwrap_arg(handles, op.args[0]) : Variant();
+		Variant arg = op.args.size() > 0 ? unwrap_arg(handles, values, op.args[0]) : Variant();
 		uint64_t oid = (uint64_t)target->get_instance_id();
 		Variant prior = target->get(prop);
 		target->set(prop, arg);
@@ -626,23 +812,12 @@ BridgeResult Bridge::execute_op(const BridgeOp &op, const std::shared_ptr<TxStat
 		}
 		// Journal-or-reject (spec editor-transactions): a mutating call we
 		// cannot invert is refused at dispatch instead of applied unjournaled.
-		if (op.write) {
-			static const char *journaled[] = {
-					"add_child", "remove_child", "set_owner", "reparent", "set_name",
-					"look_at", "look_at_from_position"};
-			bool invertible = false;
-			for (const char *j : journaled) {
-				if (method == j) {
-					invertible = true;
-				}
-			}
-			if (!invertible) {
-				return op_error("NO_UNDO", "call has no journaled inverse: " + method);
-			}
+		if (op.write && !op.untracked && !index->method_reversible(target->get_class(), method)) {
+			return op_error("NO_UNDO", "call has no journaled inverse; use mode untracked after granting tier untracked: " + method);
 		}
 		Array args;
 		for (int i = 0; i < op.args.size(); i++) {
-			args.push_back(unwrap_arg(handles, op.args[i]));
+			args.push_back(unwrap_arg(handles, values, op.args[i]));
 		}
 		uint64_t oid = (uint64_t)target->get_instance_id();
 
@@ -651,10 +826,10 @@ BridgeResult Bridge::execute_op(const BridgeOp &op, const std::shared_ptr<TxStat
 				? (Object *)args[0] : nullptr;
 		uint64_t child_oid = child ? (uint64_t)child->get_instance_id() : 0;
 		Node *child_node = child ? Object::cast_to<Node>(child) : nullptr;
-		Object *prior_owner = (method == "set_owner" && child_node)
-				? (Object *)child_node->get_owner() : nullptr;
-		uint64_t prior_owner_oid = prior_owner ? (uint64_t)prior_owner->get_instance_id() : 0;
 		Node *target_node = Object::cast_to<Node>(target);
+		Object *prior_owner = (method == "set_owner" && target_node)
+				? (Object *)target_node->get_owner() : nullptr;
+		uint64_t prior_owner_oid = prior_owner ? (uint64_t)prior_owner->get_instance_id() : 0;
 		Array warns;
 		// Unique-name guard: a node added under a parent must not clash with
 		// an existing sibling — including names saved by earlier sessions.
@@ -709,7 +884,9 @@ BridgeResult Bridge::execute_op(const BridgeOp &op, const std::shared_ptr<TxStat
 			prior_tf = target->get("global_transform");
 		}
 
-		Variant v = target->callv(StringName(method), args);
+		BridgeResult invoked = invoke_checked(target, StringName(method), args);
+		if (!invoked.ok) return invoked;
+		Variant v = invoked.value;
 
 		// Journal the structural calls we can safely invert.
 		if (method == "add_child" && child_node) {
@@ -722,9 +899,9 @@ BridgeResult Bridge::execute_op(const BridgeOp &op, const std::shared_ptr<TxStat
 			f["m"] = "remove_child"; f["a0"] = Variant(child);
 			i["m"] = "add_child"; i["a0"] = Variant(child);
 			journal(tx.get(), f, i);
-		} else if (method == "set_owner" && child_node) {
+		} else if (method == "set_owner" && target_node) {
 			Dictionary f = simple_op("call", oid), i = simple_op("call", oid);
-			f["m"] = "set_owner"; f["a0"] = args.size() > 1 ? args[1] : Variant();
+			f["m"] = "set_owner"; f["a0"] = args.size() > 0 ? args[0] : Variant();
 			i["m"] = "set_owner";
 			i["a0"] = prior_owner_oid ? Variant(ObjectDB::get_instance(ObjectID(prior_owner_oid))) : Variant();
 			journal(tx.get(), f, i);
@@ -740,7 +917,7 @@ BridgeResult Bridge::execute_op(const BridgeOp &op, const std::shared_ptr<TxStat
 			i["m"] = "set_name"; i["a0"] = prior_name;
 			journal(tx.get(), f, i);
 		} else if ((method == "look_at" || method == "look_at_from_position") &&
-				prior_tf.get_type() == Variant::TRANSFORM3D) {
+				(prior_tf.get_type() == Variant::TRANSFORM3D || prior_tf.get_type() == Variant::TRANSFORM2D)) {
 			Dictionary f = simple_op("callv", oid), i = simple_op("set", oid);
 			f["m"] = method; f["aa"] = args;
 			i["prop"] = "global_transform"; i["val"] = prior_tf;
@@ -807,7 +984,7 @@ void Bridge::drain(double budget_ms) {
 			}
 		} else {
 			pb->result = execute_op(pb->op, pb->tx);
-			if (pb->result.ok && pb->op.write && pb->tx) {
+			if (pb->result.ok && pb->result.write && pb->tx && !pb->tx->untracked) {
 				Dictionary ch;
 				ch["op"] = pb->op.kind.c_str();
 				ch["member"] = pb->op.member.c_str();
@@ -868,12 +1045,14 @@ void Bridge::reset() {
 	in_queue.clear();
 	inflight.clear();
 	handles.clear();
+	object_handles.clear();
+	values.clear();
 	retained_rc.clear();
 	for (int i = 0; i < retained_nodes.size(); i++) {
 		Variant v = retained_nodes[i];
 		if (v.get_type() == Variant::OBJECT) {
-			Object *o = v;
-			if (o && ObjectDB::get_instance(o->get_instance_id())) {
+			Object *o = v.get_validated_object();
+			if (o) {
 				// best-effort free of unadopted temp nodes only — a node
 				// already parented into the scene belongs to the tree.
 				Node *n = Object::cast_to<Node>(o);

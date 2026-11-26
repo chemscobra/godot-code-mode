@@ -3,6 +3,7 @@ build/
 build-release/
 build-windows/
 build-windows-release/
+build-windows-editor/
 
 # Godot editor cache in the demo project
 godot-cm/.godot/

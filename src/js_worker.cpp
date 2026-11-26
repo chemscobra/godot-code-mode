@@ -1,9 +1,19 @@
 #include "js_worker.hpp"
 
 #include <chrono>
+#include <cmath>
 
 #include <godot_cpp/classes/json.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
+#include <godot_cpp/variant/packed_byte_array.hpp>
+#include <godot_cpp/variant/packed_float32_array.hpp>
+#include <godot_cpp/variant/packed_float64_array.hpp>
+#include <godot_cpp/variant/packed_int32_array.hpp>
+#include <godot_cpp/variant/packed_int64_array.hpp>
+#include <godot_cpp/variant/packed_string_array.hpp>
+#include <godot_cpp/variant/packed_vector2_array.hpp>
+#include <godot_cpp/variant/packed_vector3_array.hpp>
+#include <godot_cpp/variant/packed_color_array.hpp>
 
 #include "api_index.hpp"
 #include "bridge.hpp"
@@ -111,10 +121,10 @@ ExecCtx *exec_ctx(JSContext *ctx) {
 	return static_cast<ExecCtx *>(JS_GetContextOpaque(ctx));
 }
 
-ApiIndex *ctx_index(JSContext *ctx);
+const ApiCatalog *ctx_index(JSContext *ctx);
 
 JSValue js_api_classes(JSContext *ctx, JSValueConst, int, JSValueConst *) {
-	ApiIndex *idx = ctx_index(ctx);
+	const ApiCatalog *idx = ctx_index(ctx);
 	if (!idx) {
 		return JS_ThrowInternalError(ctx, "api index not loaded");
 	}
@@ -122,7 +132,7 @@ JSValue js_api_classes(JSContext *ctx, JSValueConst, int, JSValueConst *) {
 }
 
 JSValue js_api_describe(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
-	ApiIndex *idx = ctx_index(ctx);
+	const ApiCatalog *idx = ctx_index(ctx);
 	if (!idx || argc < 1) {
 		return JS_ThrowInternalError(ctx, "api.describe(name) needs an argument");
 	}
@@ -135,7 +145,7 @@ JSValue js_api_describe(JSContext *ctx, JSValueConst, int argc, JSValueConst *ar
 }
 
 JSValue js_api_find(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
-	ApiIndex *idx = ctx_index(ctx);
+	const ApiCatalog *idx = ctx_index(ctx);
 	if (!idx || argc < 1) {
 		return JS_ThrowInternalError(ctx, "api.find(query) needs an argument");
 	}
@@ -159,18 +169,19 @@ struct InflightOp {
 
 struct ExecCtx {
 	Bridge *bridge = nullptr;
-	ApiIndex *index = nullptr;
+	std::shared_ptr<const ApiCatalog> catalog;
 	ExecBudget *budget = nullptr;
 	std::string mode = "read";
 	std::shared_ptr<std::atomic<bool>> cancel;
 	std::shared_ptr<TxState> tx;
 	std::deque<InflightOp> inflight;
+	bool native_pending = false;
 	godot::Array warnings; // non-fatal op warnings folded into diagnostics
 };
 
-ApiIndex *ctx_index(JSContext *ctx) {
+const ApiCatalog *ctx_index(JSContext *ctx) {
 	ExecCtx *ec = exec_ctx(ctx);
-	return ec ? ec->index : nullptr;
+	return ec ? ec->catalog.get() : nullptr;
 }
 
 Variant unwrap_tagged(const Variant &p);
@@ -263,6 +274,31 @@ Variant unwrap_tagged(const Variant &p) {
 			return Color((double)d.get("r", 0.0), (double)d.get("g", 0.0),
 					(double)d.get("b", 0.0), (double)d.get("a", 1.0));
 		}
+		if (t.begins_with("Packed") && d.get("values", Variant()).get_type() == Variant::ARRAY) {
+			Array items = unwrap_tagged(d["values"]);
+			for (const Variant &item : items) {
+				Variant::Type type = item.get_type();
+				bool numeric = type == Variant::INT || type == Variant::FLOAT;
+				double number = numeric ? (double)item : 0;
+				bool integer = numeric && std::isfinite(number) && std::floor(number) == number;
+				if (t == "PackedByteArray" && (!integer || number < 0 || number > 255)) return p;
+				if ((t == "PackedInt32Array" || t == "PackedInt64Array") && !integer) return p;
+				if ((t == "PackedFloat32Array" || t == "PackedFloat64Array") && type != Variant::INT && type != Variant::FLOAT) return p;
+				if (t == "PackedStringArray" && type != Variant::STRING) return p;
+				if (t == "PackedVector2Array" && type != Variant::VECTOR2) return p;
+				if (t == "PackedVector3Array" && type != Variant::VECTOR3) return p;
+				if (t == "PackedColorArray" && type != Variant::COLOR) return p;
+			}
+			if (t == "PackedByteArray") return PackedByteArray(items);
+			if (t == "PackedInt32Array") return PackedInt32Array(items);
+			if (t == "PackedInt64Array") return PackedInt64Array(items);
+			if (t == "PackedFloat32Array") return PackedFloat32Array(items);
+			if (t == "PackedFloat64Array") return PackedFloat64Array(items);
+			if (t == "PackedStringArray") return PackedStringArray(items);
+			if (t == "PackedVector2Array") return PackedVector2Array(items);
+			if (t == "PackedVector3Array") return PackedVector3Array(items);
+			if (t == "PackedColorArray") return PackedColorArray(items);
+		}
 		return p;
 	}
 	for (const Variant &k : d.keys()) {
@@ -314,12 +350,13 @@ JSValue submit_op(JSContext *ctx, const char *kind, uint64_t target,
 	op.class_name = class_name ? class_name : "";
 	op.args = args;
 	op.elements = elements;
-	op.write = arg_is_write(kind, member);
-	op.write_mode = (ec->mode == "write");
+	op.write = String(kind) == "call" ? false : arg_is_write(kind, member);
+	op.write_mode = (ec->mode == "write" || ec->mode == "untracked");
+	op.untracked = (ec->mode == "untracked");
 	if (ec->budget) {
 		ec->budget->ops.fetch_add(op_count);
 	}
-	if (op.write && ec_ref->mode != "write") {
+	if (op.write && !op.write_mode) {
 		return JS_ThrowInternalError(ctx, "PERMISSION: write op in read mode");
 	}
 	auto pb = ec->bridge->enqueue(op, ec->cancel, ec->tx);
@@ -351,7 +388,17 @@ JSValue js_godot_create(JSContext *ctx, JSValueConst, int argc, JSValueConst *ar
 	if (s) {
 		JS_FreeCString(ctx, s);
 	}
-	return submit_op(ctx, "create", 0, "", Array(), cls.utf8().get_data());
+	Array args;
+	for (int i = 1; i < argc; i++) args.push_back(js_to_variant(ctx, argv[i]));
+	return submit_op(ctx, "create", 0, "", args, cls.utf8().get_data());
+}
+
+JSValue js_godot_singleton(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
+	if (argc < 1 || !JS_IsString(argv[0])) return JS_ThrowTypeError(ctx, "godot.getSingleton(className)");
+	const char *name = JS_ToCString(ctx, argv[0]);
+	JSValue result = submit_op(ctx, "singleton", 0, "", Array(), name ? name : "");
+	if (name) JS_FreeCString(ctx, name);
+	return result;
 }
 
 JSValue js_godot_editor_scene(JSContext *ctx, JSValueConst, int, JSValueConst *) {
@@ -423,7 +470,7 @@ JSValue js_godot_batch(JSContext *ctx, JSValueConst, int argc, JSValueConst *arg
 			args.push_back(d["value"]);
 		}
 		out["args"] = args;
-		out["write"] = arg_is_write(kind.utf8().get_data(), member.utf8().get_data());
+		out["write"] = kind == "call" ? false : arg_is_write(kind.utf8().get_data(), member.utf8().get_data());
 		elements.push_back(out);
 	}
 	return submit_op(ctx, "batch", 0, "", Array(), "", elements, len);
@@ -471,7 +518,13 @@ JSValue js_godot_call(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv
 	for (int i = 2; i < argc; i++) {
 		args.push_back(js_to_variant(ctx, argv[i]));
 	}
-	return submit_op(ctx, "call", hid, method.utf8().get_data(), args);
+	String class_name;
+	if (JS_IsString(argv[0])) {
+		const char *name = JS_ToCString(ctx, argv[0]);
+		class_name = name ? String::utf8(name) : String();
+		if (name) JS_FreeCString(ctx, name);
+	}
+	return submit_op(ctx, "call", hid, method.utf8().get_data(), args, class_name.utf8().get_data());
 }
 
 // godot.connect(emitter, signal, to, method, flags?, binds?)
@@ -594,13 +647,18 @@ Dictionary JsWorker::submit(const ExecRequest &req) {
 
 	int64_t budget_ms = req.timeout_ms;
 	if (budget_ms <= 0) {
-		budget_ms = req.mode == "write" ? DEFAULT_WRITE_TIMEOUT_MS : DEFAULT_TIMEOUT_MS;
+		budget_ms = req.mode != "read" ? DEFAULT_WRITE_TIMEOUT_MS : DEFAULT_TIMEOUT_MS;
 	}
 	std::unique_lock<std::mutex> lock(mutex);
 	bool finished = job->done->wait_for(lock, std::chrono::milliseconds(budget_ms + 10000),
 			[&] { return !job->result->is_empty() || quit.load(); });
 	if (!finished) {
-		return error_result("WORKER_TIMEOUT", "execution exceeded worker deadline", "execute");
+		if (req.cancel) req.cancel->store(true);
+		Dictionary result = error_result("WORKER_TIMEOUT", "native execution did not settle before the worker deadline; outcome unknown, inspect state before retrying", "execute");
+		result["mode"] = req.mode.c_str();
+		result["outcome"] = "unknown";
+		result["rollback_supported"] = req.mode == "write";
+		return result;
 	}
 	return *job->result;
 }
@@ -618,16 +676,20 @@ void JsWorker::run() {
 			queue.pop_front();
 		}
 		Dictionary res = execute_one(job->req);
-		*job->result = res;
+		{
+			std::lock_guard<std::mutex> lock(mutex);
+			*job->result = res;
+		}
 		job->done->notify_all();
 	}
 }
 
 Dictionary JsWorker::execute_one(const ExecRequest &req) {
+	if (req.mode != "read" && req.mode != "write" && req.mode != "untracked") return error_result("INVALID_MODE", "mode must be read, write or untracked", "validate");
 	ExecBudget budget;
 	int64_t timeout_ms = req.timeout_ms;
 	if (timeout_ms <= 0) {
-		timeout_ms = req.mode == "write" ? DEFAULT_WRITE_TIMEOUT_MS : DEFAULT_TIMEOUT_MS;
+		timeout_ms = req.mode != "read" ? DEFAULT_WRITE_TIMEOUT_MS : DEFAULT_TIMEOUT_MS;
 	}
 	budget.deadline = std::chrono::steady_clock::now() +
 			std::chrono::milliseconds(timeout_ms);
@@ -646,11 +708,12 @@ Dictionary JsWorker::execute_one(const ExecRequest &req) {
 
 	ExecCtx ec;
 	ec.bridge = bridge;
-	ec.index = api_index;
 	ec.budget = &budget;
 	ec.mode = req.mode;
 	ec.cancel = req.cancel ? req.cancel : std::make_shared<std::atomic<bool>>(false);
 	ec.tx = req.tx ? req.tx : std::make_shared<TxState>();
+	ec.tx->untracked = req.mode == "untracked";
+	if (api_index) ec.catalog = api_index->snapshot();
 	JS_SetContextOpaque(ctx, &ec);
 
 	JSValue global = JS_GetGlobalObject(ctx);
@@ -668,6 +731,7 @@ Dictionary JsWorker::execute_one(const ExecRequest &req) {
 		JSValue godot_obj = JS_NewObject(ctx);
 		JS_SetPropertyStr(ctx, godot_obj, "mode", JS_NewString(ctx, req.mode.c_str()));
 		JS_SetPropertyStr(ctx, godot_obj, "create", JS_NewCFunction(ctx, js_godot_create, "create", 1));
+		JS_SetPropertyStr(ctx, godot_obj, "getSingleton", JS_NewCFunction(ctx, js_godot_singleton, "getSingleton", 1));
 		JS_SetPropertyStr(ctx, godot_obj, "get", JS_NewCFunction(ctx, js_godot_get, "get", 2));
 		JS_SetPropertyStr(ctx, godot_obj, "set", JS_NewCFunction(ctx, js_godot_set, "set", 3));
 		JS_SetPropertyStr(ctx, godot_obj, "call", JS_NewCFunction(ctx, js_godot_call, "call", 2));
@@ -742,6 +806,8 @@ Dictionary JsWorker::execute_one(const ExecRequest &req) {
 			std::this_thread::sleep_for(std::chrono::milliseconds(1));
 		}
 		if (!ec.inflight.empty()) {
+			ec.native_pending = true;
+			ec.cancel->store(true);
 			// Loop exited with ops still pending (interrupt or cancel).
 			// Reject them all so awaiting code settles instead of leaking
 			// live objects into JS_FreeRuntime's gc list.
@@ -760,7 +826,11 @@ Dictionary JsWorker::execute_one(const ExecRequest &req) {
 			}
 		}
 		JSPromiseStateEnum st = JS_PromiseState(ctx, val);
-		if (st == JS_PROMISE_FULFILLED) {
+		if (budget.tripped.load()) {
+			out = error_result("INTERRUPTED", "cooperative execution budget exceeded", "execute");
+		} else if (ec.cancel && ec.cancel->load()) {
+			out = error_result("CANCELLED", "execution cancelled", "execute");
+		} else if (st == JS_PROMISE_FULFILLED) {
 			JSValue r = JS_PromiseResult(ctx, val);
 			JSValue json = JS_JSONStringify(ctx, r, JS_UNDEFINED, JS_UNDEFINED);
 			const char *s = JS_ToCString(ctx, json);
@@ -819,6 +889,11 @@ Dictionary JsWorker::execute_one(const ExecRequest &req) {
 	JS_FreeValue(ctx, val);
 	JS_FreeValue(ctx, global);
 
+	bool pending_native_ops = ec.native_pending || !ec.inflight.empty();
+	if (pending_native_ops) {
+		ec.cancel->store(true);
+		if (out.get("ok", false)) out = error_result("UNAWAITED_OPS", "await all bridge operations before returning", "execute");
+	}
 	free_inflight(ctx, &ec);
 
 	// Drain pending jobs before freeing: the interrupt handler stays tripped,
@@ -831,6 +906,7 @@ Dictionary JsWorker::execute_one(const ExecRequest &req) {
 	}
 	JS_FreeContext(ctx);
 	JS_FreeRuntime(rt);
+	if (pending_native_ops && bridge) wait_bridge_op(bridge, "barrier", &ec);
 
 	// Transaction epilogue (spec editor-transactions): a successful write
 	// execution commits one undoable action; any failure rolls the journal
@@ -852,7 +928,11 @@ Dictionary JsWorker::execute_one(const ExecRequest &req) {
 	}
 	if (ec.tx) {
 		out["changes"] = ec.tx->changes;
+		out["effects"] = ec.tx->effects;
+		out["partial"] = req.mode == "untracked" && !(bool)out.get("ok", false) && !ec.tx->effects.is_empty();
 	}
+	out["mode"] = req.mode.c_str();
+	out["rollback_supported"] = req.mode == "write";
 	// Op warnings (e.g. MIXED_SPACE) surface as diagnostics; the op itself
 	// already applied — the agent decides whether to act on the hint.
 	if (!ec.warnings.is_empty()) {

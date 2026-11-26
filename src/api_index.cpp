@@ -2,6 +2,13 @@
 
 #include <godot_cpp/classes/file_access.hpp>
 #include <godot_cpp/classes/json.hpp>
+#include <godot_cpp/classes/class_db_singleton.hpp>
+#include <godot_cpp/classes/editor_interface.hpp>
+#include <godot_cpp/classes/engine.hpp>
+#include <godot_cpp/classes/project_settings.hpp>
+#include <godot_cpp/classes/resource_loader.hpp>
+#include <godot_cpp/classes/script.hpp>
+#include <godot_cpp/classes/node.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 
 using namespace godot;
@@ -22,6 +29,80 @@ static Variant parse_json_file(const String &path) {
 	return j->get_data();
 }
 
+static Variant plain_metadata(const Variant &value, int depth = 0) {
+	if (depth > 32) return Variant();
+	if (value.get_type() == Variant::ARRAY) {
+		Array result;
+		for (const Variant &item : (Array)value) result.push_back(plain_metadata(item, depth + 1));
+		return result;
+	}
+	if (value.get_type() == Variant::DICTIONARY) {
+		Dictionary source = value, result;
+		for (const Variant &key : source.keys()) {
+			if (key.get_type() == Variant::STRING || key.get_type() == Variant::STRING_NAME) result[String(key)] = plain_metadata(source[key], depth + 1);
+		}
+		return result;
+	}
+	if (value.get_type() == Variant::STRING_NAME) return String(value);
+	return value.get_type() <= Variant::STRING ? value : Variant();
+}
+
+static bool reversible_method(const String &owner, const String &method) {
+	if (owner == "Node") return method == "add_child" || method == "remove_child" || method == "set_owner" || method == "reparent" || method == "set_name";
+	return (owner == "Node3D" || owner == "Node2D") && (method == "look_at" || method == "look_at_from_position");
+}
+
+static Dictionary reflected_type(const Dictionary &raw, bool returns = false) {
+	Dictionary result;
+	result["name"] = raw.get("name", "");
+	String cls = raw.get("class_name", "");
+	Variant type = raw.get("type", (int)Variant::NIL);
+	result["type"] = !cls.is_empty() ? cls : type.get_type() == Variant::INT ? Variant::get_type_name((Variant::Type)(int)type) : String(type);
+	if (type.get_type() == Variant::INT && (int)type == Variant::NIL) result["type"] = ((int)raw.get("usage", 0) & PROPERTY_USAGE_NIL_IS_VARIANT) ? "Variant" : returns ? "void" : "Variant";
+	return result;
+}
+
+static Dictionary reflected_method(const Dictionary &raw) {
+	Dictionary result;
+	result["name"] = raw.get("name", "");
+	result["return_value"] = reflected_type(raw.get("return", Dictionary()), true);
+	Array arguments;
+	Array args = raw.get("args", Array());
+	Array defaults = raw.get("default_args", Array());
+	for (int i = 0; i < args.size(); i++) {
+		Dictionary arg = reflected_type(args[i]);
+		int d = i - (args.size() - defaults.size());
+		if (d >= 0) arg["default"] = plain_metadata(defaults[d]);
+		arguments.push_back(arg);
+	}
+	result["arguments"] = arguments;
+	int flags = raw.get("flags", 0);
+	result["is_const"] = bool(flags & METHOD_FLAG_CONST);
+	result["is_static"] = bool(flags & METHOD_FLAG_STATIC);
+	return result;
+}
+
+void ApiIndex::observe_script(Object *object) {
+	if (!object) return;
+	Ref<Script> script = Object::cast_to<Script>(object) ? Ref<Script>(Object::cast_to<Script>(object)) : Ref<Script>(object->get_script());
+	for (int depth = 0; script.is_valid() && depth < 64; depth++, script = script->get_base_script()) {
+		if (script->get_path().begins_with("res://")) observed_scripts[script->get_path()] = true;
+	}
+}
+
+String ApiIndex::script_class(Object *object) const {
+	if (!object) return "";
+	Ref<Script> script = Object::cast_to<Script>(object) ? Ref<Script>(Object::cast_to<Script>(object)) : Ref<Script>(object->get_script());
+	if (script.is_null()) return "";
+	String name = script->get_global_name();
+	return name.is_empty() ? "script:" + script->get_path() : name;
+}
+
+std::shared_ptr<const ApiCatalog> ApiIndex::snapshot() const {
+	std::lock_guard<std::mutex> lock(catalog_mutex);
+	return catalog;
+}
+
 bool ApiIndex::load(const String &api_path, const String &allowlist_path) {
 	Variant api_v = parse_json_file(api_path);
 	Variant allow_v = parse_json_file(allowlist_path);
@@ -29,15 +110,124 @@ bool ApiIndex::load(const String &api_path, const String &allowlist_path) {
 		UtilityFunctions::printerr("[godot-cm] failed to load api index or allowlist");
 		return false;
 	}
-	Dictionary cfg = allow_v;
+	api_document = api_v;
+	policy_document = allow_v;
+	loaded = false;
+	return refresh();
+}
+
+bool ApiIndex::refresh() {
+	ClassDBSingleton *cdb = ClassDBSingleton::get_singleton();
+	PackedStringArray native_names = cdb->get_class_list();
+	EditorInterface *editor = EditorInterface::get_singleton();
+	Array pending = editor ? Array(editor->get_open_scene_roots()) : Array();
+	for (int i = 0; i < pending.size() && i < 4096; i++) {
+		Node *node = Object::cast_to<Node>((Object *)pending[i]);
+		if (!node) continue;
+		observe_script(node);
+		pending.append_array(node->get_children());
+	}
+	Array scripts = ProjectSettings::get_singleton()->get_global_class_list();
+	Dictionary paths;
+	for (const Variant &item : scripts) paths[((Dictionary)item).get("path", "")] = true;
+	for (const Variant &path : observed_scripts.keys()) {
+		if (paths.has(path)) continue;
+		Dictionary info;
+		info["class"] = "script:" + String(path);
+		info["path"] = path;
+		scripts.push_back(info);
+	}
+	for (int i = 0; i < scripts.size(); i++) {
+		Dictionary info = ((Dictionary)scripts[i]).duplicate();
+		String path = info.get("path", "");
+		if (ResourceLoader::get_singleton()->has_cached(path)) {
+			Ref<Script> script(ResourceLoader::get_singleton()->get_cached_ref(path));
+			if (script.is_valid()) {
+				observe_script(script.ptr());
+				String global_name = script->get_global_name();
+				info["class"] = global_name.is_empty() ? "script:" + path : global_name;
+				Ref<Script> base = script->get_base_script();
+				String base_name = base.is_valid() ? String(base->get_global_name()) : String();
+				info["base"] = base.is_valid() ? base_name.is_empty() ? "script:" + base->get_path() : base_name : String(script->get_instance_base_type());
+				Array methods;
+				for (const Variant &method : script->get_script_method_list()) methods.push_back(reflected_method(method));
+				Array properties;
+				for (const Variant &property : script->get_script_property_list()) properties.push_back(reflected_type(property));
+				info["methods"] = methods;
+				info["properties"] = properties;
+			}
+		}
+		scripts[i] = info;
+	}
+	PackedStringArray singleton_names = Engine::get_singleton()->get_singleton_list();
+	uint64_t next_revision = (((uint64_t)Variant(native_names).hash() << 32) ^ scripts.hash()) + Variant(singleton_names).hash();
+	if (loaded && !dirty && next_revision == revision) return true;
+	dirty = false;
+	Dictionary cfg = policy_document;
 	bool deny_mode = String(cfg.get("mode", "")) == "denylist";
 	Dictionary allow = cfg.get("classes", Dictionary());
-	Array api_classes = ((Dictionary)api_v).get("classes", Array());
-	Array api_singletons = ((Dictionary)api_v).get("singletons", Array());
+	Array api_classes = api_document.get("classes", Array());
+	Array api_singletons = api_document.get("singletons", Array());
 	// EditorInterface etc. live under "singletons" or "classes" depending on the dump.
 	Array all;
 	for (int i = 0; i < api_classes.size(); i++) all.push_back(api_classes[i]);
 	for (int i = 0; i < api_singletons.size(); i++) all.push_back(api_singletons[i]);
+	Dictionary aliases;
+	for (const String &name : singleton_names) {
+		Object *object = Engine::get_singleton()->get_singleton(name);
+		if (!object) continue;
+		String cls = object->get_class();
+		Array names = aliases.get(cls, Array());
+		names.push_back(name);
+		aliases[cls] = names;
+	}
+	Array editor_alias;
+	editor_alias.push_back("EditorInterface");
+	aliases["EditorInterface"] = editor_alias;
+	for (const String &name : native_names) {
+		Dictionary cls;
+		cls["name"] = name;
+		cls["inherits"] = cdb->get_parent_class(name);
+		cls["kind"] = "native_class";
+		cls["singletons"] = aliases.get(name, Array());
+		auto api_type = cdb->class_get_api_type(name);
+		cls["source"] = api_type == ClassDBSingleton::API_EXTENSION || api_type == ClassDBSingleton::API_EDITOR_EXTENSION ? "extension" : "engine";
+		Array methods;
+		for (const Variant &method : cdb->class_get_method_list(name, true)) methods.push_back(reflected_method(method));
+		cls["methods"] = methods;
+		Array properties;
+		Array inherited_methods = cdb->class_get_method_list(name);
+		for (const Variant &property : cdb->class_get_property_list(name, true)) {
+			Dictionary raw = property;
+			if ((int)raw.get("usage", 0) & (PROPERTY_USAGE_GROUP | PROPERTY_USAGE_CATEGORY | PROPERTY_USAGE_SUBGROUP)) continue;
+			Dictionary property_info = reflected_type(raw);
+			String getter = cdb->class_get_property_getter(name, raw.get("name", ""));
+			property_info["is_const"] = false;
+			for (const Variant &method : inherited_methods) {
+				Dictionary info = method;
+				if (String(info.get("name", "")) == getter) {
+					property_info["is_const"] = bool((int)info.get("flags", 0) & METHOD_FLAG_CONST);
+					break;
+				}
+			}
+			properties.push_back(property_info);
+		}
+		cls["properties"] = properties;
+		Dictionary constants;
+		for (const String &key : cdb->class_get_integer_constant_list(name)) constants[key] = cdb->class_get_integer_constant(name, key);
+		cls["constants"] = constants;
+		all.push_back(cls);
+	}
+	for (const Variant &item : scripts) {
+		Dictionary info = item;
+		Dictionary cls = info.duplicate();
+		cls["name"] = info.get("class", "");
+		cls["inherits"] = info.get("base", "");
+		cls["kind"] = "script_class";
+		cls["source"] = info.get("language", "project_script");
+		cls["metadata_status"] = info.has("methods") ? "cached_members" : "class_only";
+		all.push_back(cls);
+	}
 
 	// Full dump map for ancestor lookups: an allowlisted class with "*"
 	// covers members it inherits, even from non-allowlisted bases.
@@ -53,6 +243,9 @@ bool ApiIndex::load(const String &api_path, const String &allowlist_path) {
 	Dictionary deny_global;
 	Dictionary deny_members;
 	Dictionary restrict_cfg;
+	for (const char *name : {"McpService", "SpikeRunner", "BridgePump"}) deny_classes[name] = true;
+	tiered = Dictionary();
+	tier_classes = Dictionary();
 	if (deny_mode) {
 		Array dc = cfg.get("deny_classes", Array());
 		for (int i = 0; i < dc.size(); i++) deny_classes[dc[i]] = true;
@@ -76,23 +269,32 @@ bool ApiIndex::load(const String &api_path, const String &allowlist_path) {
 				tiered[cls_list[i]] = tier;
 			}
 		}
-		tier_policy = cfg.get("tier_policy", Dictionary());
+		if (!loaded) tier_policy = cfg.get("tier_policy", Dictionary());
 		// Persistent grants + trust mode: no dialog, no friction.
-		Array pre = cfg.get("unlocked_tiers", Array());
-		for (int i = 0; i < pre.size(); i++) {
-			unlocked[pre[i]] = true;
-		}
-		if (cfg.get("auto_grant_tiers", false)) {
-			for (const Variant &t : tier_classes.keys()) {
-				unlocked[t] = true;
+		if (!loaded) {
+			Array pre = cfg.get("unlocked_tiers", Array());
+			for (int i = 0; i < pre.size(); i++) unlocked[pre[i]] = true;
+			if (cfg.get("auto_grant_tiers", false)) {
+				for (const Variant &t : tier_classes.keys()) unlocked[t] = true;
 			}
 		}
 	}
+	Array untracked_notice;
+	untracked_notice.push_back("Native and project-script execution without undo or rollback; code may have arbitrary side effects, including file and network access.");
+	tier_classes["untracked"] = untracked_notice;
 
-	index.clear();
+	index = Dictionary();
 	for (int i = 0; i < all.size(); i++) {
 		Dictionary cls = all[i];
 		String name = cls.get("name", "");
+		bool denied = name.is_empty();
+		String ancestor = name;
+		for (int guard = 0; !ancestor.is_empty() && all_map.has(ancestor) && guard < 64; guard++) {
+			denied = denied || deny_classes.has(ancestor);
+			if (!tiered.has(name) && tiered.has(ancestor)) tiered[name] = tiered[ancestor];
+			ancestor = ((Dictionary)all_map[ancestor]).get("inherits", "");
+		}
+		if (denied || (String(cls.get("kind", "")) != "script_class" && !cdb->class_exists(name))) continue;
 		if (deny_mode ? deny_classes.has(name) : !allow.has(name)) {
 			continue;
 		}
@@ -111,9 +313,13 @@ bool ApiIndex::load(const String &api_path, const String &allowlist_path) {
 			}
 		}
 		Dictionary perms;
+		String restriction = name;
+		for (int guard = 0; !restriction.is_empty() && !restrict_cfg.has(restriction) && all_map.has(restriction) && guard < 64; guard++) {
+			restriction = ((Dictionary)all_map[restriction]).get("inherits", "");
+		}
 		if (deny_mode) {
-			if (restrict_cfg.has(name)) {
-				perms = restrict_cfg[name];
+			if (restrict_cfg.has(restriction)) {
+				perms = restrict_cfg[restriction];
 			} else {
 				Dictionary all_star;
 				all_star["methods"] = "*";
@@ -130,6 +336,14 @@ bool ApiIndex::load(const String &api_path, const String &allowlist_path) {
 
 		Dictionary entry;
 		entry["inherits"] = cls.get("inherits", "");
+		entry["kind"] = cls.get("kind", "native_class");
+		entry["source"] = cls.get("source", "engine");
+		entry["singletons"] = cls.get("singletons", Array());
+		entry["construct_mode"] = String(entry["source"]) == "engine" ? "write" : "untracked";
+		entry["constants"] = cls.get("constants", Dictionary());
+		entry["tier"] = tiered.get(name, "");
+		if (cls.has("path")) entry["path"] = cls["path"];
+		if (cls.has("metadata_status")) entry["metadata_status"] = cls["metadata_status"];
 		Array methods;
 		Array cls_methods = cls.get("methods", Array());
 		for (int m = 0; m < cls_methods.size(); m++) {
@@ -148,6 +362,12 @@ bool ApiIndex::load(const String &api_path, const String &allowlist_path) {
 			sig["name"] = mname;
 			sig["return"] = md.get("return_value", md.get("return_type", Variant()));
 			sig["arguments"] = md.get("arguments", Array());
+			sig["is_const"] = md.get("is_const", false);
+			sig["is_static"] = md.get("is_static", false);
+			sig["script"] = String(cls.get("kind", "")) == "script_class";
+			sig["owner"] = name;
+			sig["source"] = cls.get("source", "engine");
+			sig["mode"] = (bool)sig["is_const"] && !(bool)sig["script"] ? "read" : String(sig["source"]) == "engine" && reversible_method(name, mname) ? "write" : "untracked";
 			methods.push_back(sig);
 		}
 		entry["methods"] = methods;
@@ -173,6 +393,11 @@ bool ApiIndex::load(const String &api_path, const String &allowlist_path) {
 			Dictionary sig;
 			sig["name"] = pname;
 			sig["type"] = pd.get("type", "");
+			sig["script"] = String(cls.get("kind", "")) == "script_class";
+			sig["source"] = cls.get("source", "engine");
+			sig["is_const"] = pd.get("is_const", false);
+			sig["read_mode"] = (bool)sig["is_const"] && !(bool)sig["script"] ? "read" : "untracked";
+			sig["write_mode"] = String(sig["source"]) == "engine" ? "write" : "untracked";
 			props.push_back(sig);
 		}
 		entry["properties"] = props;
@@ -195,6 +420,12 @@ bool ApiIndex::load(const String &api_path, const String &allowlist_path) {
 						sig["name"] = md.get("name", "");
 						sig["return"] = md.get("return_value", md.get("return_type", Variant()));
 						sig["arguments"] = md.get("arguments", Array());
+						sig["is_const"] = md.get("is_const", false);
+						sig["is_static"] = md.get("is_static", false);
+						sig["script"] = String(b.get("kind", "")) == "script_class";
+						sig["owner"] = base;
+						sig["source"] = b.get("source", "engine");
+						sig["mode"] = (bool)sig["is_const"] && !(bool)sig["script"] ? "read" : String(sig["source"]) == "engine" && reversible_method(base, bmname) ? "write" : "untracked";
 						methods.push_back(sig);
 					}
 				}
@@ -213,6 +444,11 @@ bool ApiIndex::load(const String &api_path, const String &allowlist_path) {
 						Dictionary sig;
 						sig["name"] = pd.get("name", "");
 						sig["type"] = pd.get("type", "");
+						sig["script"] = String(b.get("kind", "")) == "script_class";
+						sig["source"] = b.get("source", "engine");
+						sig["is_const"] = pd.get("is_const", false);
+						sig["read_mode"] = (bool)sig["is_const"] && !(bool)sig["script"] ? "read" : "untracked";
+						sig["write_mode"] = String(sig["source"]) == "engine" ? "write" : "untracked";
 						props.push_back(sig);
 					}
 				}
@@ -224,11 +460,16 @@ bool ApiIndex::load(const String &api_path, const String &allowlist_path) {
 		index[name] = entry;
 	}
 	loaded = true;
+	revision = next_revision;
+	{
+		std::lock_guard<std::mutex> lock(catalog_mutex);
+		catalog = std::make_shared<ApiCatalog>(index);
+	}
 	UtilityFunctions::print("[godot-cm] api index loaded: ", index.size(), " classes");
 	return true;
 }
 
-Array ApiIndex::classes() const {
+Array ApiCatalog::classes() const {
 	Array out;
 	Array names = index.keys();
 	for (int i = 0; i < names.size(); i++) {
@@ -236,19 +477,23 @@ Array ApiIndex::classes() const {
 		String n = names[i];
 		c["name"] = n;
 		c["inherits"] = ((Dictionary)index[n]).get("inherits", "");
+		Dictionary entry = index[n];
+		for (const char *key : {"kind", "source", "path", "metadata_status", "tier", "singletons", "construct_mode"}) {
+			if (entry.has(key)) c[key] = entry[key];
+		}
 		out.push_back(c);
 	}
 	return out;
 }
 
-Variant ApiIndex::describe(const String &name) const {
+Variant ApiCatalog::describe(const String &name) const {
 	if (!index.has(name)) {
 		return Variant();
 	}
 	return index[name];
 }
 
-Array ApiIndex::find(const String &query) const {
+Array ApiCatalog::find(const String &query) const {
 	Array out;
 	String q = query.to_lower();
 	Array names = index.keys();
@@ -260,12 +505,17 @@ Array ApiIndex::find(const String &query) const {
 		}
 		// match members too
 		Dictionary e = index[n];
-		Array ms = e.get("methods", Array());
-		bool hit = false;
-		for (int m = 0; m < ms.size() && !hit; m++) {
-			if (String(((Dictionary)ms[m]).get("name", "")).to_lower().contains(q)) {
-				hit = true;
+		bool hit = String(e.get("path", "")).to_lower().contains(q) || String(e.get("source", "")).to_lower().contains(q);
+		for (const char *field : {"methods", "properties"}) {
+			Array members = e.get(field, Array());
+			for (const Variant &item : members) {
+				if (String(((Dictionary)item).get("name", "")).to_lower().contains(q)) { hit = true; break; }
 			}
+		}
+		Array keys = ((Dictionary)e.get("constants", Dictionary())).keys();
+		keys.append_array(e.get("singletons", Array()));
+		for (const Variant &key : keys) {
+			if (String(key).to_lower().contains(q)) { hit = true; break; }
 		}
 		if (hit) {
 			out.push_back(n);
@@ -304,9 +554,9 @@ static String ts_type(const Variant &t) {
 bool ApiIndex::generate_dts(const String &path) const {
 	String out;
 	out += "// Generated by godot-cm from the permission-filtered API index. Do not edit.\n";
-	out += "declare type GodotHandle = { readonly __godotHandle: string };\n\n";
+	out += "declare type GodotHandle = { readonly __godotHandle: string; readonly class_name?: string; readonly script_class?: string };\n\n";
 	out += "declare namespace api {\n";
-	out += "\tfunction classes(): { name: string; inherits: string }[];\n";
+	out += "\tfunction classes(): { name: string; inherits: string; kind: string; source: string; path?: string; metadata_status?: string; singletons: string[]; construct_mode: string }[];\n";
 	out += "\tfunction describe(name: string): {\n";
 	out += "\t\tinherits: string;\n";
 	out += "\t\tmethods: { name: string; arguments: any[]; return: any }[];\n";
@@ -318,6 +568,7 @@ bool ApiIndex::generate_dts(const String &path) const {
 	Array names = index.keys();
 	for (int i = 0; i < names.size(); i++) {
 		String cls = names[i];
+		if (!cls.is_valid_identifier()) continue;
 		Dictionary e = index[cls];
 		out += "declare namespace " + cls + " {\n";
 		Array ms = e.get("methods", Array());
@@ -350,11 +601,12 @@ bool ApiIndex::generate_dts(const String &path) const {
 	}
 
 	out += "declare namespace godot {\n";
-	out += "\tconst mode: \"read\" | \"write\";\n";
-	out += "\tfunction create(className: string): Promise<GodotHandle>;\n";
+	out += "\tconst mode: \"read\" | \"write\" | \"untracked\";\n";
+	out += "\tfunction create(className: string, ...constructorArgs: any[]): Promise<GodotHandle>;\n";
+	out += "\tfunction getSingleton(name: string): Promise<GodotHandle>;\n";
 	out += "\tfunction get(handle: GodotHandle, prop: string): Promise<any>;\n";
 	out += "\tfunction set(handle: GodotHandle, prop: string, value: any): Promise<void>;\n";
-	out += "\tfunction call(handle: GodotHandle, method: string, ...args: any[]): Promise<any>;\n";
+	out += "\tfunction call(handle: GodotHandle | string, method: string, ...args: any[]): Promise<any>;\n";
 	out += "\tfunction saveScene(): Promise<void>;\n";
 	out += "\tfunction unlockWrites(): Promise<{ was_locked: boolean }>;\n";
 	out += "\tfunction requestTier(tier: string): Promise<{ granted: boolean; tier: string; already_unlocked?: boolean }>;\n";
@@ -446,6 +698,48 @@ bool ApiIndex::class_allowed(const String &class_name) const {
 		return false;
 	}
 	return true;
+}
+
+Dictionary ApiIndex::member_info(const String &class_name, const String &member, bool property) const {
+	if (!index.has(class_name)) return Dictionary();
+	Array members = ((Dictionary)index[class_name]).get(property ? "properties" : "methods", Array());
+	for (const Variant &item : members) {
+		Dictionary info = item;
+		if (String(info.get("name", "")) == member) return info;
+	}
+	return Dictionary();
+}
+
+bool ApiIndex::method_reversible(const String &class_name, const String &method) const {
+	Dictionary info = member_info(class_name, method);
+	return String(info.get("source", "")) == "engine" && reversible_method(info.get("owner", ""), method);
+}
+
+bool ApiIndex::property_reversible(const String &class_name, const String &property) const {
+	return String(member_info(class_name, property, true).get("source", "")) == "engine";
+}
+
+bool ApiIndex::method_is_const(const String &class_name, const String &method) const {
+	if (!index.has(class_name)) return false;
+	Array methods = ((Dictionary)index[class_name]).get("methods", Array());
+	for (const Variant &item : methods) {
+		Dictionary info = item;
+		if (String(info.get("name", "")) == method) return (bool)info.get("is_const", false) && !(bool)info.get("script", false);
+	}
+	return false;
+}
+
+bool ApiIndex::member_declared(const String &class_name, const String &member) const {
+	if (!index.has(class_name)) return false;
+	Dictionary entry = index[class_name];
+	for (const char *key : {"methods", "properties"}) {
+		Array members = entry.get(key, Array());
+		for (const Variant &item : members) {
+			Dictionary info = item;
+			if (String(info.get("name", "")) == member && (bool)info.get("script", false)) return true;
+		}
+	}
+	return false;
 }
 
 bool ApiIndex::member_allowed(const String &class_name, const String &member) const {

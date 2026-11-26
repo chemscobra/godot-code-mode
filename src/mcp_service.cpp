@@ -8,6 +8,7 @@
 #include <thread>
 
 #include <godot_cpp/classes/engine.hpp>
+#include <godot_cpp/classes/gd_extension_manager.hpp>
 #include <godot_cpp/classes/file_access.hpp>
 #include <godot_cpp/classes/json.hpp>
 #include <godot_cpp/classes/project_settings.hpp>
@@ -22,7 +23,7 @@ namespace godot_cm {
 
 static const char *PROTOCOL_VERSION = "2025-11-25";
 static const char *SERVER_NAME = "godot-cm";
-static const char *SERVER_VERSION = "0.1.0";
+static const char *SERVER_VERSION = "0.2.0";
 
 void McpService::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("start", "port"), &McpService::start);
@@ -161,7 +162,7 @@ Variant McpService::handle_tools_list(const Variant &id) {
 
 	Dictionary search;
 	search["name"] = "search";
-	search["description"] = "Run read-only JS over the API metadata index (api.classes/api.describe/api.find).";
+	search["description"] = "Run read-only JS over a consistent snapshot of the runtime API catalog (api.classes/api.describe/api.find), including installed native extensions and project script classes. Uncached scripts have partial metadata; discovery never loads or instantiates them.";
 	Dictionary search_schema;
 	search_schema["type"] = "object";
 	Dictionary search_props;
@@ -177,10 +178,14 @@ Variant McpService::handle_tools_list(const Variant &id) {
 
 	Dictionary exec;
 	exec["name"] = "execute";
-	exec["description"] = "Run an async JS function against the editor bridge. mode: read|write (default read). "
-			"Most engine classes are allowed; if a call fails with a locked permission tier "
-			"(network, filesystem, ...), call godot.requestTier(tier) and retry — "
-			"godot.unlockedTiers() lists what's already granted.";
+	exec["description"] = "Run async JS against the editor. mode: read|write|untracked (default read). "
+			"read permits queries and native const methods; write journals supported edits and rejects methods without an inverse. "
+			"untracked permits generic native and project-script execution without rollback after await godot.requestTier('untracked') is granted. "
+			"Untracked code may have arbitrary effects, including file/network access; this is not a sandbox for plugin code. "
+			"Failures retain prior effects; inspect effects and partial before retrying. Denied classes/members and direct-use permission tiers remain enforced. "
+			"Use api.describe for signatures/constants, godot.create(className), godot.getSingleton(name), and godot.call(handleOrStaticClass, method, ...args). "
+			"Project constructors and custom script members require untracked mode; uncached project constructors also require filesystem permission. "
+			"Installed plugins require no adapters or core recompilation. requestTier/unlockedTiers manage per-session grants.";
 	Dictionary exec_schema;
 	exec_schema["type"] = "object";
 	Dictionary exec_props;
@@ -188,14 +193,15 @@ Variant McpService::handle_tools_list(const Variant &id) {
 	Dictionary timeout_prop;
 	timeout_prop["type"] = "integer";
 	timeout_prop["description"] =
-			"Wall-clock budget in ms (default 5000 read / 60000 write). "
-			"Failed writes roll back atomically.";
+			"Cooperative budget in ms (default 5000 read / 60000 write or untracked). "
+			"write edits roll back on failure; untracked effects never roll back. Native calls cannot be forcibly interrupted.";
 	exec_props["timeoutMs"] = timeout_prop;
 	Dictionary mode_prop;
 	mode_prop["type"] = "string";
 	Array modes;
 	modes.push_back("read");
 	modes.push_back("write");
+	modes.push_back("untracked");
 	mode_prop["enum"] = modes;
 	mode_prop["default"] = "read";
 	exec_props["mode"] = mode_prop;
@@ -345,7 +351,7 @@ bool McpService::start(int p_port) {
 	api_index = std::make_unique<ApiIndex>();
 	if (api_index->load("res://addons/godot_cm/extension_api.json",
 			    "res://addons/godot_cm/allowlist.json")) {
-		api_index->generate_dts("res://addons/godot_cm/api-surface.d.ts");
+		api_index->generate_dts("user://godot_cm-api-surface.d.ts");
 	}
 
 	bridge = std::make_unique<Bridge>();
@@ -363,6 +369,7 @@ bool McpService::start(int p_port) {
 		pump.instantiate();
 		pump->bridge = bridge.get();
 		tree->connect("process_frame", Callable(pump.ptr(), "pump"));
+		GDExtensionManager::get_singleton()->connect("extensions_reloaded", Callable(pump.ptr(), "invalidate_catalog"));
 	} else {
 		UtilityFunctions::printerr("[godot-cm] no SceneTree; bridge disabled");
 	}
@@ -470,6 +477,9 @@ void McpService::stop() {
 		if (tree && tree->is_connected("process_frame", Callable(pump.ptr(), "pump"))) {
 			tree->disconnect("process_frame", Callable(pump.ptr(), "pump"));
 		}
+		GDExtensionManager *extensions = GDExtensionManager::get_singleton();
+		Callable refresh(pump.ptr(), "invalidate_catalog");
+		if (extensions && extensions->is_connected("extensions_reloaded", refresh)) extensions->disconnect("extensions_reloaded", refresh);
 		pump.unref();
 	}
 	if (bridge) {

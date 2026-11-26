@@ -2,8 +2,9 @@
 
 MCP "code mode" for the Godot editor: two tools (`search`, `execute`) backed by a
 bounded QuickJS-NG runtime inside a GDExtension addon. Agents write JavaScript
-that awaits authorized editor operations; writes are grouped into one undoable
-editor action per `execute` call.
+that awaits authorized editor operations. Supported edits can be grouped into
+one undoable editor action; an explicit `untracked` mode also permits calls
+whose effects cannot be rolled back.
 
 - Godot floor: **4.7** (validated on 4.7.2, linux-x86_64)
 - MCP spec: **2025-11-25** (Streamable HTTP on loopback + stdio adapter)
@@ -76,15 +77,68 @@ the token it reads from the session file.
 | Tool      | Purpose                                                    |
 |-----------|------------------------------------------------------------|
 | `search`  | Run JS against the immutable API index (`api.*` only)      |
-| `execute` | Run JS with `api.*` + `godot.*` bridge (`mode`: read/write)|
+| `execute` | Run JS with `api.*` + `godot.*` (`read`, `write`, `untracked`) |
 
-Inside `execute`: `godot.editor.getEditedScene()`, `godot.create(cls)`,
-`godot.get/set(handle, prop, v)`, `godot.call(handle, m, ...)`,
+The catalog reflects the running editor: native engine/GDExtension classes,
+singleton aliases, registered project-script classes, and loaded anonymous
+scripts encountered through the bridge or edited scene trees. `api.classes()`,
+`api.find()` and `api.describe()` share a permission-filtered snapshot per call.
+Discovery never loads or instantiates an uncached script: these entries carry
+`metadata_status:"class_only"` until explicitly loaded. Cached script members,
+paths, source, constructor mode and member execution modes are described too.
+Godot's own rules still apply, including tool-script and signature requirements.
+
+Inside `execute`: `godot.editor.getEditedScene()`, `godot.create(cls, ...args)`,
+`godot.getSingleton(name)`, `godot.get/set(handle, prop, v)`,
+`godot.call(handleOrStaticClassName, method, ...args)`,
 `godot.batch([{op, ...}])`, `godot.saveScene()`, `godot.unlockWrites()`.
-All `godot.*` calls return promises resolved on the editor main thread;
-write ops require `mode:"write"`, are journaled, and commit as a single
-editor Undo step — or roll back on failure. Ops with no journaled inverse
-are rejected with `NO_UNDO` rather than applied unrevertably.
+All `godot.*` calls return promises resolved on the editor main thread; await
+all operations before returning.
+
+| Mode | Contract |
+|------|----------|
+| `read` | Queries and methods/accessors declared const by the native API. |
+| `write` | Supported engine-property edits and calls with known inverses, journaled as one editor Undo action; errors trigger rollback. Unknown inverses still return `NO_UNDO`. |
+| `untracked` | Generic native/project-script execution after granting the separate `untracked` tier. No transaction, Undo action or rollback is promised. |
+
+For example, first use `execute` in `read` mode to request authorization:
+
+```js
+return await godot.requestTier("untracked");
+```
+
+After approval, use another `execute` with `mode:"untracked"`:
+
+```js
+const editor = await godot.getSingleton("EditorInterface");
+await godot.call(editor, "play_current_scene");
+```
+
+No plugin-specific adapter or registration is required. Unknown native/plugin
+mutations, script calls/constructors/accessors and callbacks with unknown effects
+use `untracked`; they are not classified as safe just because their names start
+with `get_` or `is_`. Direct class/member restrictions, filesystem/network tiers
+and the write lock still apply, including to batches. Invoked plugin/project
+code is trusted code, not a filesystem/network sandbox: the `untracked` approval
+explicitly covers its arbitrary side effects.
+
+Responses include `mode`, `rollback_supported`, `effects` and `partial`.
+On an `untracked` failure, effects may already have occurred; inspect state
+before retrying. `effects` records attempted/dispatched non-reversible operations,
+not a guarantee that a plugin completed its domain operation successfully.
+JavaScript cancellation cannot preempt a running native method. The bridge waits
+for in-flight native calls to settle before reporting their effects; if the outer
+worker deadline expires first, `outcome:"unknown"` is returned instead.
+
+Vectors/colors use tagged values such as `{$t:"Vector3",x:1,y:2,z:3}`.
+Packed inputs use `{$t:"PackedByteArray",values:[0,1,255]}` (also numeric,
+string, vector and color packed arrays). Other non-JSON values are opaque
+`__godotValue` references that can be passed back as arguments/properties.
+Object references include their native `class_name` and, when applicable,
+`script_class`; use that symbol with `api.describe()` or `godot.create()`.
+Unknown allocator methods may return caller-owned orphan nodes; adopt/free
+them explicitly rather than expecting the bridge to delete borrowed objects.
+Runtime declarations are written to `user://godot_cm-api-surface.d.ts`.
 
 `godot.batch` applies a list of ops in **one** main-thread dispatch and
 resolves with ordered per-element results — the fast path for op-dense

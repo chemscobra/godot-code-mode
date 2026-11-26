@@ -171,6 +171,7 @@ func _build_dock(port: int, base: int) -> void:
 		policies.add_child(policies_label)
 		const POLICIES := ["allow", "ask", "deny"]
 		const TIER_BLURBS := {
+			"untracked": "Generic native and project-script execution without undo or rollback. Called code may modify scene state, access files or use the network. Direct class/member restrictions still apply; plugin code is not sandboxed.",
 			"network": "Sockets, HTTP requests, multiplayer peers (ENet, WebSocket, WebRTC).\nLow risk on its own — the agent can't reach your files without the filesystem tier.",
 			"filesystem": "Reading/writing arbitrary files on disk (FileAccess, DirAccess, ResourceLoader…).\nThis is the sensitive one: it can read .env files, SSH keys, project secrets.\nKeeping it on 'ask' means you get a dialog before any file access.",
 		}

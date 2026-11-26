@@ -33,10 +33,13 @@ struct BridgeOp {
 	bool write = false;     // mutating op (requires mode=write)
 	godot::Array elements;  // kind=="batch": [{kind,target,class_name,member,args,write}]
 	bool write_mode = false; // caller session permits writes (batch element gating)
+	bool untracked = false;
 };
 
 struct BridgeResult {
 	bool ok = false;
+	bool dispatched = false;
+	bool write = false;
 	godot::Variant value;               // Object* results arrive as {"$handle": id}
 	godot::String error_code;
 	godot::String error_message;
@@ -51,6 +54,8 @@ struct TxState {
 	godot::Array journal;        // entries {"f": fwd-op, "i": inverse-op}
 	int64_t undo_version = -1;   // EditorUndoRedoManager version at first write
 	std::atomic<bool> conflict{false};
+	bool untracked = false;
+	godot::Array effects;
 };
 
 // Shared worker<->main cell for one op.
@@ -69,6 +74,9 @@ class Bridge {
 	std::deque<std::shared_ptr<PendingBridge>> in_queue;
 	std::unordered_map<uint64_t, std::shared_ptr<PendingBridge>> inflight;
 	std::unordered_map<uint64_t, godot::ObjectID> handles;
+	std::unordered_map<uint64_t, uint64_t> object_handles;
+	std::unordered_map<uint64_t, godot::Variant> values;
+	uint64_t next_value = 1;
 	uint64_t next_handle = 1;
 	uint64_t next_op = 1;
 	// Strong refs kept until session reset. RefCounted objects live in a C++
@@ -83,6 +91,7 @@ class Bridge {
 	uint64_t mint_handle(godot::Object *obj);
 	godot::Variant to_wire(const godot::Variant &v);
 	BridgeResult execute_op(const BridgeOp &op, const std::shared_ptr<TxState> &tx);
+	BridgeResult dispatch_op(const BridgeOp &op, const std::shared_ptr<TxState> &tx);
 	BridgeResult finish_tx(const std::shared_ptr<TxState> &tx, bool commit);
 
 public:
@@ -117,6 +126,8 @@ protected:
 
 public:
 	Bridge *bridge = nullptr;
+	uint64_t last_catalog_refresh = 0;
+	void invalidate_catalog();
 	void pump();
 };
 
