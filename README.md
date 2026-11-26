@@ -10,6 +10,8 @@ editor action per `execute` call.
 - License: **MIT** (see `LICENSE`; bundled components in
   `addons/godot_cm/THIRD_PARTY_LICENSES.txt`)
 
+![Godot CM bottom panel: MCP endpoint, session token, and per-tier permission policies](docs/screenshots/godot_cm_panel.png)
+
 ## Install into a project
 
 **From the Asset Library** — install, then enable **Godot Code Mode** in
@@ -25,8 +27,8 @@ your-project/
     ├── plugin.cfg / plugin.gd    # EditorPlugin that owns the service
     ├── bin/                    # native core (.so linux, .dll windows)
     ├── tools/godot_cm_stdio.py # stdio adapter for MCP clients
-    ├── allowlist.json            # the ONLY authorized API surface
-    ├── api-surface.d.ts          # generated declarations = allowlist exactly
+    ├── allowlist.json            # permission config: denylist, tiers, policies
+    ├── api-surface.d.ts          # generated declarations for the exposed API
     ├── extension_api.json        # 4.7.2 dump, seed of the search index
     ├── LICENSE
     └── THIRD_PARTY_LICENSES.txt
@@ -38,10 +40,15 @@ When the plugin is active the editor serves MCP on `http://127.0.0.1:8765`
 Set `GODOT_CM_PORT` before launching the editor to change the port; the
 adapter reads the same variable.
 
-Allowlist semantics: `"*"` on a class covers members it **inherits** too —
-`"StandardMaterial3D": "*"` already permits `albedo_color` (declared on
-`BaseMaterial3D`) without a separate parent entry. Authorizing a base class
-with an explicit member list permits that member on every subclass.
+Permissions are a **denylist**: every engine class is exposed except platform
+escape paths (raw `OS`, `Script`, `Engine`, threading, capture devices, and
+meta-methods like `call`/`set`/`emit_signal` that would bypass checks). Border
+areas live in unlockable **tiers** — `network` (sockets, HTTP, multiplayer
+peers) and `filesystem` (FileAccess, DirAccess, resource importers). Each tier
+has a policy settable per session in the panel or in `allowlist.json`:
+`allow` grants `godot.requestTier()` instantly, `ask` shows a confirmation
+dialog, `deny` refuses silently. See `allowlist.json` comments for the full
+schema.
 
 ## Client configuration
 
