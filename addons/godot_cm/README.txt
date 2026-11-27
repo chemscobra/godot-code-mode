@@ -1,4 +1,4 @@
-Godot Code Mode (godot-cm) 0.3.3
+Godot Code Mode (godot-cm) 0.4.0
 ================================
 
 MCP "code mode" for the Godot editor: two tools (search, execute) backed by a

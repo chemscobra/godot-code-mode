@@ -5,6 +5,7 @@
 #include <godot_cpp/classes/object.hpp>
 #include <godot_cpp/variant/string.hpp>
 #include <godot_cpp/variant/variant.hpp>
+#include <functional>
 #include <memory>
 #include <mutex>
 
@@ -43,10 +44,17 @@ class ApiIndex : public ApiCatalog {
 	mutable std::mutex catalog_mutex;
 	std::shared_ptr<const ApiCatalog> catalog;
 	godot::Dictionary index; // class_name -> {inherits, methods[], properties[]}
-	godot::Dictionary tiered;   // class_name -> tier name (gated until unlocked)
-	godot::Dictionary tier_classes; // tier name -> [class names] (for UI)
-	godot::Dictionary unlocked; // tier name -> true
-	godot::Dictionary tier_policy;  // tier name (or "*") -> "allow"|"ask"|"deny"
+	godot::Dictionary tiered;   // class_name -> group name (gated until unlocked)
+	godot::Dictionary tier_classes; // group name -> [class names] (for UI)
+	godot::Dictionary unlocked; // group name -> true
+	godot::Dictionary tier_policy;  // group name (or "*") -> policy
+	godot::Dictionary group_protected; // group name -> true (dock never offers ask/allow)
+	godot::Dictionary group_why; // group name -> author note from the policy file
+	godot::Dictionary group_default; // group name -> shipped default policy
+	godot::Dictionary denied_write;    // class_name -> true (reads allowed, writes denied)
+	godot::Dictionary class_group;     // class_name -> group name producing its gate
+	uint64_t last_policy_reload = 0;   // ticks_msec of last applied reload
+	godot::String last_reload_status = "never"; // "never" | "applied" | "parse_error"
 	bool loaded = false;
 	bool dirty = true;
 	godot::Dictionary denied_classes;  // passive deny metadata for godot.permissions
@@ -59,6 +67,7 @@ class ApiIndex : public ApiCatalog {
 	void reload_policy();
 
 public:
+	std::function<void(bool applied)> policy_reload_cb; // fired on hot-reload apply/fail (main thread)
 	void publish_catalog(const godot::Array &scripts, const godot::Dictionary &operations);
 	void refresh_catalog();
 	bool load(const godot::String &allowlist_path);
@@ -94,6 +103,25 @@ public:
 	godot::Array tiers() const;
 	// Tier a class belongs to ("" if none / not locked).
 	godot::String tier_of(const godot::String &class_name) const;
+
+	// Unified permission groups: deny/write/ask/allow/off per named class set.
+	// `deny` = blocked entirely, `write` = reads only, `ask`/`allow` = tier gate,
+	// `off` = dormant. Legacy tiers/deny_classes migrate into this model.
+	bool class_denied(const godot::String &class_name) const;      // hard deny incl. ancestors
+	bool class_write_denied(const godot::String &class_name) const; // write/untracked ops only
+	bool member_denied_on(const godot::String &class_name, const godot::String &member, godot::String &denied_on) const;
+	bool global_member_denied(const godot::String &member) const;
+	godot::String denied_group(const godot::String &class_name) const; // group that denies it ("" if flat)
+	bool group_is_protected(const godot::String &group) const;
+	godot::Array groups() const;
+	godot::Dictionary group_info(const godot::String &group) const;
+	bool group_has_state(const godot::String &group, const godot::String &state) const;
+	// Persist a group's policy into the policy file (class lists untouched);
+	// the hot-reload then re-applies it. Returns false on unknown group/state/IO error.
+	bool save_group_policy(const godot::String &group, const godot::String &state);
+	bool reset_group_policies();
+	bool allow_all_groups(bool include_protected = false);
+	godot::Dictionary policy_status() const;
 
 	// Passive permission introspection: never grants, never executes.
 	// {allowed, reason, tier?, policy?, locked?} for one class/member, or a

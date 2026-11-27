@@ -27,7 +27,7 @@ namespace godot_cm {
 
 static const char *PROTOCOL_VERSION = "2025-11-25";
 static const char *SERVER_NAME = "godot-cm";
-static const char *SERVER_VERSION = "0.3.3";
+static const char *SERVER_VERSION = "0.4.0";
 
 void McpService::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("register_plugin_method", "name", "provider", "definition"), &McpService::register_plugin_method);
@@ -46,9 +46,18 @@ void McpService::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_tier_classes", "tier"), &McpService::get_tier_classes);
 	ClassDB::bind_method(D_METHOD("get_tier_policy", "tier"), &McpService::get_tier_policy);
 	ClassDB::bind_method(D_METHOD("set_tier_policy", "tier", "policy"), &McpService::set_tier_policy);
+	ClassDB::bind_method(D_METHOD("get_groups"), &McpService::get_groups);
+	ClassDB::bind_method(D_METHOD("get_group", "group"), &McpService::get_group);
+	ClassDB::bind_method(D_METHOD("save_group_policy", "group", "state"), &McpService::save_group_policy);
+	ClassDB::bind_method(D_METHOD("reset_group_policies"), &McpService::reset_group_policies);
+	ClassDB::bind_method(D_METHOD("allow_all_groups", "include_protected"), &McpService::allow_all_groups);
+	ClassDB::bind_method(D_METHOD("get_policy_status"), &McpService::get_policy_status);
+	ClassDB::bind_method(D_METHOD("get_other_restrictions"), &McpService::get_other_restrictions);
 	ADD_SIGNAL(MethodInfo("tier_request",
 			PropertyInfo(Variant::STRING, "tier"),
 			PropertyInfo(Variant::ARRAY, "classes")));
+	ADD_SIGNAL(MethodInfo("policy_reloaded",
+			PropertyInfo(Variant::BOOL, "applied")));
 }
 
 static String random_token() {
@@ -143,6 +152,50 @@ void McpService::set_tier_policy(const String &tier, const String &policy) {
 		}
 	}
 	UtilityFunctions::print("[godot-cm] tier '", tier, "' policy -> ", policy);
+}
+
+Array McpService::get_groups() const {
+	if (!api_index) return Array();
+	Array out;
+	for (const Variant &name : api_index->groups()) {
+		out.push_back(api_index->group_info(name));
+	}
+	return out;
+}
+
+Dictionary McpService::get_group(const String &group) const {
+	return api_index ? api_index->group_info(group) : Dictionary();
+}
+
+bool McpService::save_group_policy(const String &group, const String &state) {
+	bool ok = api_index && api_index->save_group_policy(group, state);
+	UtilityFunctions::print("[godot-cm] group '", group, "' policy -> ", state, ok ? " (saved)" : " (FAILED)");
+	return ok;
+}
+
+bool McpService::reset_group_policies() {
+	bool ok = api_index && api_index->reset_group_policies();
+	UtilityFunctions::print("[godot-cm] group policies reset to defaults", ok ? "" : " (FAILED)");
+	return ok;
+}
+
+bool McpService::allow_all_groups(bool include_protected) {
+	bool ok = api_index && api_index->allow_all_groups(include_protected);
+	UtilityFunctions::print("[godot-cm] allow-all groups", include_protected ? " (SANDBOX OFF)" : " (non-protected)", ok ? "" : " (FAILED)");
+	return ok;
+}
+
+Dictionary McpService::get_policy_status() const {
+	return api_index ? api_index->policy_status() : Dictionary();
+}
+
+Dictionary McpService::get_other_restrictions() const {
+	Dictionary out;
+	if (!api_index) return out;
+	Dictionary summary = api_index->permissions_summary();
+	out["denied_classes"] = summary.get("denied_classes", Array());
+	out["denied_members_global"] = summary.get("denied_members_global", Array());
+	return out;
 }
 
 Variant McpService::handle_initialize(const Variant &id, const Dictionary &params) {
@@ -453,6 +506,9 @@ bool McpService::start(int p_port) {
 	}
 
 	api_index = std::make_unique<ApiIndex>();
+	api_index->policy_reload_cb = [this](bool applied) {
+		emit_signal("policy_reloaded", applied);
+	};
 	if (!api_index->load("res://addons/godot_cm/allowlist.json")) return false;
 	if (OS::get_singleton()->get_environment("GODOT_CM_GENERATE_DTS") == "1") {
 		api_index->generate_dts("user://godot_cm-api-surface.d.ts");

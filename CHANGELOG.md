@@ -4,6 +4,22 @@ Release notes for the 0.3.x series. Earlier releases are available through the
 repository's Git tags. Versions below refer to the addon and MCP server, not
 the MCP protocol or Godot engine version.
 
+## 0.4.0
+
+### Unified permission groups and a discoverable dock
+
+- `allowlist.json` gains a unified `groups` schema: every sensitive surface is a named class set with one policy — `deny` (blocked entirely), `write` (reads only), `ask` (prompt via `godot.requestTier`), `allow` (silent grant), `off` (dormant). `protected` groups (execution, process, interop) can never become prompt-unlockable, including via the dock.
+- Legacy keys (`tiers`, `tier_policy`, `unlocked_tiers`, `auto_grant_tiers`, `deny_classes`, `deny_write_classes`, `deny_groups`) still load; old policy files keep working unchanged.
+- Audited deny list: `ProjectSettings`/`EditorSettings`/`TextServer*` move to `write` groups (reads allowed); `Mutex`/`Semaphore` dropped; `Crypto*` → `crypto` group and capture devices → `capture` group, both `ask` (promptable instead of impossible).
+- Every `PERMISSION` diagnostic carries a `remediation` string: `call godot.requestTier('<group>')`, `use godot.createScript / godot.attachScript` for Script-family denials, or `"denied permanently by policy (group '<name>')"`.
+- `godot.requestTier()` gets a dedicated ~120s deadline independent of execute mode — a read-mode request no longer dies on the 5s default while the dialog is open.
+- Dock rebuild: the permissions section shows the whole model — policy file row (path, "Open file", reload status), one row per group with a state combo and live lock indicator, a read-only "other restrictions" row, and the auto-approve checkbox (now scoped to `ask` groups).
+- Dock combo edits persist to `allowlist.json` via `save_group_policy` (writes only `groups.<name>.policy`; class lists stay file-authoritative); `policy_reloaded` signal rebuilds the panel so file edits appear instantly. Hot-reload applies file-wins semantics only to entries whose policy actually changed — unrelated edits no longer wipe session grants. Consecutive dock saves merge against the on-disk file, and `tier_policy` is re-seeded eagerly on reload so the panel never paints stale states.
+- Group rows show the policy file's `_why` rationale as a `ⓘ` tooltip; each row has a `↺` reset-to-default button fed by the shipped `allowlist.default.json`, plus a global "Reset defaults" that restores only policies (class lists and custom groups are kept).
+- "Allow all" trust mode behind a confirmation dialog flips every non-protected group to `allow`; an explicit "sandbox OFF" checkbox extends it to protected groups (arbitrary code execution — logged as `SANDBOX OFF`).
+- The manual test harness is now pytest: `tools/bridge_harness.py` holds the fixture/Client/stage functions, `tools/test_bridge/` has ordered functional tests (`pytest tools/test_bridge`, `-k` for granular selection); `tools/test_generic_bridge.py` remains the entry point for the pytest run and the legacy inventory/benchmark/catalog-lifecycle modes.
+- Linux integration suite and both native builds pass; Windows was cross-built, not run.
+
 ## 0.3.3
 
 ### Reduced authoring friction

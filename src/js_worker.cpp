@@ -34,6 +34,7 @@ constexpr int64_t DEFAULT_WRITE_TIMEOUT_MS = 60000;
 constexpr size_t HEAP_LIMIT = 32u << 20;   // 32 MiB
 constexpr size_t OUTPUT_LIMIT = 256 << 10; // 256 KiB
 constexpr int64_t OP_LIMIT = 1000;         // bridge ops (also interrupt ticks)
+constexpr int64_t TIER_REQUEST_MS = 120000; // requestTier parks on a human dialog: dedicated deadline
 
 struct ExecBudget {
 	std::chrono::steady_clock::time_point deadline;
@@ -383,6 +384,7 @@ struct ExecCtx {
 	Bridge *bridge = nullptr;
 	std::shared_ptr<const ApiCatalog> catalog;
 	ExecBudget *budget = nullptr;
+	std::shared_ptr<std::atomic<int64_t>> deadline_ext;
 	std::string mode = "read";
 	std::shared_ptr<std::atomic<bool>> cancel;
 	std::shared_ptr<TxState> tx;
@@ -837,6 +839,17 @@ JSValue submit_op(JSContext *ctx, const char *kind, uint64_t target,
 	op.untracked = (ec->mode == "untracked");
 	if (ec->budget) {
 		ec->budget->ops.fetch_add(op_count);
+		// requestTier parks on a human dialog: give it a dedicated deadline
+		// independent of the execute mode's default (5s read would starve it).
+		if (op_count > 0 && std::string(kind) == "request_tier") {
+			auto extended = std::chrono::steady_clock::now() + std::chrono::milliseconds(TIER_REQUEST_MS);
+			if (extended > ec->budget->deadline) {
+				ec->budget->deadline = extended;
+			}
+			if (ec->deadline_ext) {
+				ec->deadline_ext->store(TIER_REQUEST_MS);
+			}
+		}
 	}
 	if (op.write && !op.write_mode) {
 		ValueCodec::fail("PERMISSION", "write operation requires write or untracked mode");
@@ -1251,6 +1264,7 @@ JsWorker::~JsWorker() {
 Dictionary JsWorker::submit(const ExecRequest &req) {
 	auto job = std::make_shared<Job>();
 	job->req = req;
+	job->req.deadline_ext = std::make_shared<std::atomic<int64_t>>(0);
 	job->result = std::make_shared<Dictionary>();
 	job->done = std::make_shared<std::condition_variable>();
 	{
@@ -1264,8 +1278,17 @@ Dictionary JsWorker::submit(const ExecRequest &req) {
 		budget_ms = req.mode != "read" ? DEFAULT_WRITE_TIMEOUT_MS : DEFAULT_TIMEOUT_MS;
 	}
 	std::unique_lock<std::mutex> lock(mutex);
-	bool finished = job->done->wait_for(lock, std::chrono::milliseconds(budget_ms + 10000),
-			[&] { return !job->result->is_empty() || quit.load(); });
+	// requestTier ops extend the wait at runtime (deadline_ext): poll in
+	// slices so the extended deadline is honored even for read-mode calls.
+	auto settle_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(budget_ms + 10000);
+	bool finished = false;
+	while (!(finished = job->done->wait_for(lock, std::chrono::milliseconds(500),
+			[&] { return !job->result->is_empty() || quit.load(); }))) {
+		auto now = std::chrono::steady_clock::now();
+		if (now > settle_deadline + std::chrono::milliseconds(job->req.deadline_ext->load())) {
+			break;
+		}
+	}
 	if (!finished) {
 		if (req.cancel) req.cancel->store(true);
 		Dictionary result = error_result("WORKER_TIMEOUT", "native execution did not settle before the worker deadline; outcome unknown, inspect state before retrying", "execute");
@@ -1327,6 +1350,7 @@ Dictionary JsWorker::execute_one(const ExecRequest &req) {
 	ec.bridge = bridge;
 	ec.catalog = api_index ? api_index->snapshot() : nullptr;
 	ec.budget = &budget;
+	ec.deadline_ext = req.deadline_ext;
 	ec.mode = req.mode;
 	ec.cancel = req.cancel ? req.cancel : std::make_shared<std::atomic<bool>>(false);
 	ec.tx = req.tx ? req.tx : std::make_shared<TxState>();

@@ -1,0 +1,269 @@
+{
+	"mode": "denylist",
+	"_comment": "Every engine class is exposed except what the groups deny. Each group is a named class set with ONE policy: \"deny\" blocks reads and writes (never unlockable), \"write\" allows reads only, \"ask\" prompts via godot.requestTier(name) + confirmation dialog, \"allow\" grants silently, \"off\" is dormant (classes fully permitted, kept for re-enablement). \"protected\" groups are sandbox escapes: the dock will only ever offer deny/write/off for them. deny_classes/deny_members/restrict stay as flat escape hatches. Legacy tiers/tier_policy/unlocked_tiers/auto_grant_tiers still load and migrate into groups. Meta-methods (call/set/emit_signal/free/...) are always blocked in code.",
+	"groups": {
+		"execution": {
+			"policy": "deny",
+			"protected": true,
+			"_why": "Arbitrary code execution and reflection escape the sandbox entirely. Script files go through the trusted godot.createScript / godot.attachScript ops instead.",
+			"classes": [
+				"Script",
+				"GDScript",
+				"CSharpScript",
+				"ScriptExtension",
+				"ScriptLanguage",
+				"ScriptLanguageExtension",
+				"ScriptEditor",
+				"ScriptEditorBase",
+				"GDExtension",
+				"GDExtensionManager",
+				"Expression",
+				"ClassDB",
+				"EngineDebugger"
+			]
+		},
+		"process": {
+			"policy": "deny",
+			"protected": true,
+			"_why": "Process, windowing and threading control: OS.execute, engine quit, scene-tree hijack and threads would let agent code escape the worker sandbox.",
+			"classes": [
+				"OS",
+				"Engine",
+				"MainLoop",
+				"SceneTree",
+				"DisplayServer",
+				"NativeMenu",
+				"StatusIndicator",
+				"Thread",
+				"WorkerThreadPool"
+			]
+		},
+		"interop": {
+			"policy": "deny",
+			"protected": true,
+			"_why": "Bridges to other runtimes (JS, JVM) execute outside the sandbox model.",
+			"classes": [
+				"JavaScriptBridge",
+				"JavaScriptObject",
+				"JavaClass",
+				"JavaClassWrapper",
+				"JavaObject",
+				"JNISingleton"
+			]
+		},
+		"config": {
+			"policy": "write",
+			"_why": "Settings reads are agent-useful metadata (project layout, editor prefs); writes mutate project/editor state, so they stay denied.",
+			"classes": [
+				"ProjectSettings",
+				"EditorSettings",
+				"EditorCommandPalette",
+				"EditorVCSInterface"
+			]
+		},
+		"text": {
+			"policy": "write",
+			"_why": "Text shaping/font queries are harmless reads; the denied surface is mutating the TextServerManager singletons.",
+			"classes": [
+				"TextServer",
+				"TextServerAdvanced",
+				"TextServerDummy",
+				"TextServerExtension",
+				"TextServerFallback",
+				"TextServerManager"
+			]
+		},
+		"capture": {
+			"policy": "ask",
+			"_why": "Camera/microphone access is a privacy gate: promptable rather than impossible.",
+			"classes": [
+				"CameraServer",
+				"CameraFeed",
+				"AudioStreamMicrophone",
+				"AudioEffectRecord",
+				"AudioEffectCapture"
+			]
+		},
+		"crypto": {
+			"policy": "ask",
+			"_why": "Key generation, signing and cert handling could touch user identity material; prompt-gated.",
+			"classes": [
+				"Crypto",
+				"CryptoKey",
+				"X509Certificate",
+				"AESContext",
+				"HMACContext"
+			]
+		},
+		"network": {
+			"policy": "allow",
+			"_why": "Sockets, HTTP, multiplayer peers. Low risk on its own — cannot reach files without filesystem.",
+			"classes": [
+				"IP",
+				"TCPServer",
+				"TCPStream",
+				"UDPServer",
+				"DTLSServer",
+				"PacketPeer",
+				"PacketPeerDTLS",
+				"PacketPeerExtension",
+				"PacketPeerStream",
+				"PacketPeerUDP",
+				"StreamPeer",
+				"StreamPeerBuffer",
+				"StreamPeerExtension",
+				"StreamPeerGZIP",
+				"StreamPeerTCP",
+				"StreamPeerTLS",
+				"TLSOptions",
+				"HTTPClient",
+				"HTTPRequest",
+				"WebSocketPeer",
+				"WebRTCDataChannel",
+				"WebRTCDataChannelExtension",
+				"WebRTCMultiplayerPeer",
+				"WebRTCPeerConnection",
+				"WebRTCPeerConnectionExtension",
+				"ENetConnection",
+				"ENetMultiplayerPeer",
+				"ENetPacketPeer",
+				"MultiplayerAPI",
+				"MultiplayerAPIExtension",
+				"MultiplayerPeer",
+				"MultiplayerPeerExtension",
+				"OfflineMultiplayerPeer",
+				"SceneMultiplayer",
+				"UPnP",
+				"UPnPDevice"
+			]
+		},
+		"filesystem": {
+			"policy": "ask",
+			"_why": "Reading/writing arbitrary files on disk. The sensitive one: it can read .env files, SSH keys, project secrets.",
+			"classes": [
+				"FileAccess",
+				"DirAccess",
+				"FileSystemDock",
+				"ConfigFile",
+				"XMLParser",
+				"ZIPPacker",
+				"ZIPReader",
+				"PCKPacker",
+				"ResourceLoader",
+				"ResourceSaver",
+				"ResourceFormatLoader",
+				"ResourceFormatSaver",
+				"EditorFileSystem",
+				"EditorFileSystemDirectory",
+				"EditorPaths",
+				"EditorImportPlugin",
+				"EditorSceneFormatImporter",
+				"EditorSceneFormatImporterBlend",
+				"EditorSceneFormatImporterFBX2glTF",
+				"EditorSceneFormatImporterGLTF",
+				"EditorSceneFormatImporterUFBX",
+				"EditorScenePostImport",
+				"EditorScenePostImportPlugin",
+				"EditorExportPlatform",
+				"EditorExportPlugin",
+				"EditorExportPreset",
+				"TranslationServer"
+			]
+		},
+		"untracked": {
+			"policy": "ask",
+			"_why": "Generic native and project-script execution without undo or rollback; called code may touch scene, files or network. Not a class gate — a mode gate.",
+			"classes": []
+		}
+	},
+	"unlocked_tiers": [],
+	"auto_grant_tiers": false,
+	"deny_classes": [],
+	"_audit_note": "Dropped vs 0.3.3 deny list: Mutex and Semaphore (inert without Thread, which stays denied). Moved to write-only: ProjectSettings, EditorSettings, EditorCommandPalette, EditorVCSInterface, TextServer* (reads are harmless lookups). Moved to ask groups: capture and crypto classes (unlockable with a prompt instead of impossible).",
+	"deny_members": {
+		"Image": [
+			"load",
+			"load_from_file",
+			"save_png",
+			"save_jpg",
+			"save_exr",
+			"save_webp",
+			"save_dds",
+			"save_tga"
+		],
+		"FontFile": [
+			"load_dynamic_font",
+			"load_bitmap_font"
+		],
+		"AudioStreamOggVorbis": [
+			"load_from_file"
+		],
+		"CompressedTexture2D": [
+			"load_path"
+		],
+		"CompressedTexture3D": [
+			"load_path"
+		],
+		"Viewport": [
+			"get_texture"
+		],
+		"EditorInterface": [
+			"restart_editor",
+			"make_mesh_previews"
+		],
+		"Input": [
+			"warp_mouse"
+		],
+		"Node": [
+			"rpc",
+			"rpc_id",
+			"rpc_config"
+		]
+	},
+	"restrict": {
+		"EditorInterface": {
+			"methods": [
+				"get_edited_scene_root",
+				"get_open_scene_roots",
+				"get_open_scenes",
+				"get_selected_paths",
+				"get_resource_filesystem",
+				"get_editor_paths",
+				"get_script_editor",
+				"get_editor_undo_redo",
+				"edit_node",
+				"edit_resource",
+				"inspect_object",
+				"select_file",
+				"open_scene_from_path",
+				"reload_scene_from_path",
+				"save_scene",
+				"save_scene_as",
+				"save_all_scenes",
+				"get_current_path",
+				"get_current_directory",
+				"play_main_scene",
+				"play_current_scene",
+				"play_custom_scene",
+				"stop_playing_scene",
+				"is_playing_scene",
+				"get_playing_scene",
+				"set_main_screen_editor",
+				"get_current_editor",
+				"get_editor_main_screen",
+				"get_editor_viewport_3d",
+				"get_editor_viewport_2d",
+				"get_editor_scale",
+				"popup_dialog",
+				"popup_create_dialog",
+				"popup_node_selector",
+				"get_selection",
+				"get_inspector",
+				"get_resource_previewer",
+				"get_base_control",
+				"get_editor_toaster"
+			],
+			"properties": []
+		}
+	}
+}

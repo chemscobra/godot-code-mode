@@ -29,3 +29,4 @@ godot-cm/
 
 # Built addon binaries (distributed via dist/*.zip, not git)
 addons/godot_cm/bin/
+.venv-test

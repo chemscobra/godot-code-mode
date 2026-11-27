@@ -73,6 +73,15 @@ public:
 	godot::String get_tier_policy(const godot::String &tier) const;
 	void set_tier_policy(const godot::String &tier, const godot::String &policy);
 
+	// Unified permission groups for the dock (spec permission-console).
+	godot::Array get_groups() const;
+	godot::Dictionary get_group(const godot::String &group) const;
+	bool save_group_policy(const godot::String &group, const godot::String &state);
+	bool reset_group_policies();
+	bool allow_all_groups(bool include_protected = false);
+	godot::Dictionary get_policy_status() const;
+	godot::Dictionary get_other_restrictions() const;
+
 	McpService() = default;
 	~McpService() override;
 };

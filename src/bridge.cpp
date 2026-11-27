@@ -512,6 +512,65 @@ static String member_denied_msg(ApiIndex *index, Object *obj, const String &kind
 	return msg;
 }
 
+static BridgeResult op_permission(const String &msg, const String &remediation = "") {
+	BridgeResult r = op_error("PERMISSION", msg);
+	if (!remediation.is_empty()) {
+		r.error_context["remediation"] = remediation;
+	}
+	return r;
+}
+
+// Every denial names its way forward: a tier to request, a trusted op to
+// use, or an honest "never". `for_write` distinguishes read-only denials.
+static String remediation_for(ApiIndex *index, const String &cls, const String &member, bool for_write) {
+	if (index == nullptr) {
+		return "";
+	}
+	static const char *script_family[] = {
+		"Script", "GDScript", "CSharpScript", "ScriptExtension",
+		"ScriptLanguage", "ScriptLanguageExtension", "ScriptEditor", "ScriptEditorBase",
+	};
+	ClassDBSingleton *cdb = ClassDBSingleton::get_singleton();
+	for (String c = cls; !c.is_empty();) {
+		for (const char *s : script_family) {
+			if (c == s) {
+				return "denied permanently by policy; use godot.createScript / godot.attachScript instead";
+			}
+		}
+		if (index->class_denied(c)) {
+			String g = index->denied_group(c);
+			return g.is_empty() ? String("denied permanently by policy")
+					: String("denied permanently by policy (group '" + g + "')");
+		}
+		String t = index->tier_of(c);
+		if (!t.is_empty()) {
+			String p = index->policy_of(t);
+			if (p == "deny" || p == "write") {
+				return "group '" + t + "' policy is " + p + " — not unlockable this session";
+			}
+			return "call godot.requestTier(\"" + t + "\")";
+		}
+		c = cdb ? cdb->get_parent_class(c) : "";
+	}
+	if (for_write && index->class_write_denied(cls)) {
+		return "writes denied permanently by policy; read-only calls on this class are allowed";
+	}
+	if (!member.is_empty()) {
+		if (index->global_member_denied(member)) {
+			return "meta-method blocked by design; use the dedicated godot.* helpers";
+		}
+		String denied_on;
+		if (index->member_denied_on(cls, member, denied_on)) {
+			return "member denied on " + denied_on + "; see allowlist.json deny_members/restrict";
+		}
+	}
+	return "";
+}
+
+static String remediation_for_obj(ApiIndex *index, Object *obj, const String &member, bool for_write) {
+	return obj ? remediation_for(index, obj->get_class(), member, for_write) : String();
+}
+
 // Passive scene inspection: names, native classes, script paths — no script
 // loading or instantiation. depth/maxNodes bound the walk; truncation is
 // reported instead of cutting mid-subtree.
@@ -765,8 +824,8 @@ BridgeResult Bridge::execute_op(const BridgeOp &incoming, const std::shared_ptr<
 	}
 	PerfScope validation_cost(PerfMetric::VALIDATION_NS);
 	if ((kind == "get" || kind == "set" || (kind == "call" && op.class_name.empty())) && !target) return op_error("INVALID_HANDLE", "handle expired or unknown");
-	if (target && (kind == "get" || kind == "set" || kind == "call") && !member_authorized(index, target, op.member.c_str(), kind != "call")) return op_error("PERMISSION", member_denied_msg(index, target, kind, op.member.c_str()));
-	if (kind == "call" && !op.class_name.empty() && (!index || !index->member_allowed(op.class_name.c_str(), op.member.c_str()))) return op_error("PERMISSION", "static member not allowed or class tier locked");
+	if (target && (kind == "get" || kind == "set" || kind == "call") && !member_authorized(index, target, op.member.c_str(), kind != "call")) return op_permission(member_denied_msg(index, target, kind, op.member.c_str()), remediation_for_obj(index, target, op.member.c_str(), kind != "get"));
+	if (kind == "call" && !op.class_name.empty() && (!index || !index->member_allowed(op.class_name.c_str(), op.member.c_str()))) return op_permission("static member not allowed or class tier locked", remediation_for(index, op.class_name.c_str(), op.member.c_str(), true));
 	if (index && target && (kind == "get" || kind == "set")) {
 		Dictionary property = index->member_info(target->get_class(), op.member.c_str(), true);
 		bool unknown = kind == "get" ? !(bool)property.get("is_const", false) : !index->property_reversible(target->get_class(), op.member.c_str());
@@ -784,11 +843,14 @@ BridgeResult Bridge::execute_op(const BridgeOp &incoming, const std::shared_ptr<
 		op.write = true;
 		if (!op.untracked) return op_error("UNTRACKED_REQUIRED", "project script access requires mode untracked and explicit permission");
 	}
-	if (op.write && !op.write_mode) return op_error("PERMISSION", "mutating operation in read mode");
+	if (op.write && !op.write_mode) return op_permission("mutating operation in read mode", "rerun with mode \"write\" or \"untracked\"");
 	if (op.write && op.untracked && (!index || !index->tier_unlocked("untracked"))) {
-		return op_error("PERMISSION", "request tier untracked before executing without rollback");
+		return op_permission("request tier untracked before executing without rollback", "call godot.requestTier(\"untracked\")");
 	}
 	String effect_class = target ? String(target->get_class()) : String(op.class_name.c_str());
+	if (op.write && index && !effect_class.is_empty() && index->class_write_denied(effect_class)) {
+		return op_permission("writes denied on read-only group: " + effect_class, remediation_for(index, effect_class, op.member.c_str(), true));
+	}
 	if (op.write && kind != "unlock_writes" && write_locked.load()) return op_error("TX_LOCKED", "writes locked pending review");
 	validation_cost.stop();
 	BridgeResult result;
@@ -860,7 +922,7 @@ BridgeResult Bridge::dispatch_op(const BridgeOp &op, const std::shared_ptr<TxSta
 
 	if (kind == "save_scene") {
 		if (!op.untracked) return op_error("UNTRACKED_REQUIRED", "saving is not undoable; use mode untracked");
-		if (!index || !index->tier_unlocked("filesystem")) return op_error("PERMISSION", "saving requires filesystem permission");
+		if (!index || !index->tier_unlocked("filesystem")) return op_permission("saving requires filesystem permission", "call godot.requestTier(\"filesystem\")");
 		EditorInterface *ei = EditorInterface::get_singleton();
 		if (ei == nullptr) {
 			return op_error("NO_EDITOR", "EditorInterface unavailable");
@@ -922,7 +984,7 @@ BridgeResult Bridge::dispatch_op(const BridgeOp &op, const std::shared_ptr<TxSta
 			if (sub.kind != "create" && sub.kind != "get" && sub.kind != "set" && sub.kind != "call" && sub.kind != "connect" && sub.kind != "disconnect" && sub.kind != "singleton") {
 				r = op_error("BAD_OP", "invalid or nested batch element");
 			} else if (sub.write && !op.write_mode) {
-				r = op_error("PERMISSION", "write op in read mode");
+				r = op_permission("write op in read mode", "rerun with mode \"write\" or \"untracked\"");
 			} else {
 				r = execute_op(sub, tx);
 				for (int w = 0; w < r.warnings.size(); w++) {
@@ -965,13 +1027,13 @@ BridgeResult Bridge::dispatch_op(const BridgeOp &op, const std::shared_ptr<TxSta
 		Object *object = cls == "EditorInterface" ? EditorInterface::get_singleton()
 				: Engine::get_singleton()->has_singleton(cls) ? Engine::get_singleton()->get_singleton(cls) : nullptr;
 		if (!object) return op_error("NOT_FOUND", "singleton unavailable: " + cls);
-		if (!index || !index->class_allowed(object->get_class())) return op_error("PERMISSION", "singleton not allowed or class tier locked: " + cls);
+		if (!index || !index->class_allowed(object->get_class())) return op_permission("singleton not allowed or class tier locked: " + cls, remediation_for(index, object->get_class(), "", false));
 		return op_value(to_wire(object));
 	}
 
 	if (kind == "call" && !op.class_name.empty()) {
 		String cls = op.class_name.c_str(), method = op.member.c_str();
-		if (!index || !index->member_allowed(cls, method)) return op_error("PERMISSION", "static method not allowed: " + cls + "." + method);
+		if (!index || !index->member_allowed(cls, method)) return op_permission("static method not allowed: " + cls + "." + method, remediation_for(index, cls, method, true));
 		Dictionary entry = index->describe(cls);
 		bool is_static = false;
 		for (const Variant &item : (Array)entry.get("methods", Array())) {
@@ -989,7 +1051,7 @@ BridgeResult Bridge::dispatch_op(const BridgeOp &op, const std::shared_ptr<TxSta
 			String path = entry.get("path", "");
 			ResourceLoader *loader = ResourceLoader::get_singleton();
 			if (!path.begins_with("res://") || path.simplify_path() != path || path.contains("\\")) return op_error("BAD_PATH", "invalid project class path");
-			if (!loader->has_cached(path) && !index->tier_unlocked("filesystem")) return op_error("PERMISSION", "loading a project class requires filesystem permission");
+			if (!loader->has_cached(path) && !index->tier_unlocked("filesystem")) return op_permission("loading a project class requires filesystem permission", "call godot.requestTier(\"filesystem\")");
 			script = loader->has_cached(path) ? loader->get_cached_ref(path) : loader->load(path);
 			if (script.is_null()) return op_error("LOAD_FAILED", "could not load project class");
 		}
@@ -1022,10 +1084,10 @@ BridgeResult Bridge::dispatch_op(const BridgeOp &op, const std::shared_ptr<TxSta
 		if ((external && kind != "plugin_action") || (!external && kind == "plugin_action")) {
 			return op_error("EFFECT_MISMATCH", "use pluginAction only for declared external actions");
 		}
-		if (!read_only && !external && kind != "plugin_call") return op_error("PERMISSION", "plugin method requires write mode");
+		if (!read_only && !external && kind != "plugin_call") return op_permission("plugin method requires write mode", "use godot.pluginCall / pluginAction in write or untracked mode");
 		String tier = entry.get("tier", "");
 		if (!tier.is_empty() && (!index || !index->tier_unlocked(tier))) {
-			return op_error("PERMISSION", "plugin method requires tier: " + tier);
+			return op_permission("plugin method requires tier: " + tier, index && index->policy_of(tier) == "deny" ? String("group '" + tier + "' policy is deny — not unlockable this session") : String("call godot.requestTier(\"" + tier + "\")"));
 		}
 		Object *provider = ObjectDB::get_instance(ObjectID((uint64_t)entry["provider"]));
 		String method = entry.get("method", "");
@@ -1076,7 +1138,7 @@ BridgeResult Bridge::dispatch_op(const BridgeOp &op, const std::shared_ptr<TxSta
 
 	if (kind == "load_resource") {
 		if (!index || !index->member_allowed("ResourceLoader", "load")) {
-			return op_error("PERMISSION", "ResourceLoader.load not allowed; check filesystem tier");
+			return op_permission("ResourceLoader.load not allowed; check filesystem tier", "call godot.requestTier(\"filesystem\")");
 		}
 		String path = op.member.c_str();
 		PackedStringArray parts = path.substr(6).split("/");
@@ -1088,11 +1150,11 @@ BridgeResult Bridge::dispatch_op(const BridgeOp &op, const std::shared_ptr<TxSta
 		ResourceLoader *loader = ResourceLoader::get_singleton();
 		if (!loader->get_recognized_extensions_for_type("").has(extension) ||
 				loader->get_recognized_extensions_for_type("Script").has(extension)) {
-			return op_error("PERMISSION", "unsupported or script resource extension");
+			return op_permission("unsupported or script resource extension", "denied permanently by policy");
 		}
 		Ref<Resource> resource = loader->load(path);
 		if (resource.is_null()) return op_error("LOAD_FAILED", "could not load: " + path);
-		if (!index->class_allowed(resource->get_class())) return op_error("PERMISSION", "resource class not allowed");
+		if (!index->class_allowed(resource->get_class())) return op_permission("resource class not allowed", remediation_for(index, resource->get_class(), "", false));
 		return op_value(to_wire(resource));
 	}
 
@@ -1106,7 +1168,7 @@ BridgeResult Bridge::dispatch_op(const BridgeOp &op, const std::shared_ptr<TxSta
 					msg += " (tier '" + t + "' locked — unlock via godot.requestTier(\"" + t + "\"))";
 				}
 			}
-			return op_error("PERMISSION", msg);
+			return op_permission(msg, remediation_for(index, cls, "", true));
 		}
 		ClassDBSingleton *cdb = ClassDBSingleton::get_singleton();
 		Dictionary entry = index->describe(cls);
@@ -1125,7 +1187,7 @@ BridgeResult Bridge::dispatch_op(const BridgeOp &op, const std::shared_ptr<TxSta
 			String path = entry.get("path", "");
 			if (!path.begins_with("res://") || path.simplify_path() != path || path.contains("\\")) return op_error("BAD_PATH", "invalid project class path");
 			ResourceLoader *loader = ResourceLoader::get_singleton();
-			if (!loader->has_cached(path) && !index->tier_unlocked("filesystem")) return op_error("PERMISSION", "loading an uncached project class requires filesystem permission");
+			if (!loader->has_cached(path) && !index->tier_unlocked("filesystem")) return op_permission("loading an uncached project class requires filesystem permission", "call godot.requestTier(\"filesystem\")");
 			Ref<Script> script(loader->has_cached(path) ? loader->get_cached_ref(path) : loader->load(path));
 			if (script.is_null()) return op_error("LOAD_FAILED", "project script could not be loaded");
 			Array constructor_args;
@@ -1196,7 +1258,7 @@ BridgeResult Bridge::dispatch_op(const BridgeOp &op, const std::shared_ptr<TxSta
 
 	if (kind == "instantiate_scene") {
 		if (!index || !index->member_allowed("PackedScene", "instantiate")) {
-			return op_error("PERMISSION", "PackedScene.instantiate not allowed");
+			return op_permission("PackedScene.instantiate not allowed", remediation_for(index, "PackedScene", "instantiate", true));
 		}
 		PackedScene *scene = Object::cast_to<PackedScene>(target);
 		if (!scene) return op_error("BAD_TARGET", "instantiateScene requires a PackedScene handle");
@@ -1223,7 +1285,7 @@ BridgeResult Bridge::dispatch_op(const BridgeOp &op, const std::shared_ptr<TxSta
 		StringName method = op.args.size() > 1
 				? StringName(String(op.args[1])) : StringName();
 		if (index) { index->observe_script(to); index->refresh(); }
-		if (!index || !index->class_allowed(target->get_class()) || !member_authorized(index, to, method)) return op_error("PERMISSION", "signal source or callback is not authorized");
+		if (!index || !index->class_allowed(target->get_class()) || !member_authorized(index, to, method)) return op_permission("signal source or callback is not authorized", remediation_for_obj(index, target, method, true));
 		if (kind == "connect" && !op.untracked && (!index->method_is_const(to->get_class(), method) || index->member_declared(index->script_class(to), method))) return op_error("UNTRACKED_REQUIRED", "callbacks with unknown effects require mode untracked");
 		Callable cb(to, method);
 		if (kind == "connect") {
@@ -1267,7 +1329,7 @@ BridgeResult Bridge::dispatch_op(const BridgeOp &op, const std::shared_ptr<TxSta
 	if (kind == "get") {
 		String prop = op.member.c_str();
 		if (!member_authorized(index, target, prop, true)) {
-			return op_error("PERMISSION", member_denied_msg(index, target, "property", prop));
+			return op_permission(member_denied_msg(index, target, "property", prop), remediation_for_obj(index, target, prop, false));
 		}
 		PerfScope native_cost(PerfMetric::NATIVE_NS);
 		Variant v = target->get(prop);
@@ -1278,7 +1340,7 @@ BridgeResult Bridge::dispatch_op(const BridgeOp &op, const std::shared_ptr<TxSta
 	if (kind == "set") {
 		String prop = op.member.c_str();
 		if (!member_authorized(index, target, prop, true)) {
-			return op_error("PERMISSION", member_denied_msg(index, target, "property", prop));
+			return op_permission(member_denied_msg(index, target, "property", prop), remediation_for_obj(index, target, prop, true));
 		}
 		Variant arg = op.args.size() > 0 ? op.args[0] : Variant();
 		uint64_t oid = (uint64_t)target->get_instance_id();
@@ -1296,7 +1358,7 @@ BridgeResult Bridge::dispatch_op(const BridgeOp &op, const std::shared_ptr<TxSta
 	if (kind == "call") {
 		String method = op.member.c_str();
 		if (!member_authorized(index, target, method)) {
-			return op_error("PERMISSION", member_denied_msg(index, target, "method", method));
+			return op_permission(member_denied_msg(index, target, "method", method), remediation_for_obj(index, target, method, true));
 		}
 		// Journal-or-reject (spec editor-transactions): a mutating call we
 		// cannot invert is refused at dispatch instead of applied unjournaled.
@@ -1556,11 +1618,18 @@ void Bridge::drain(double budget_ms) {
 				d["granted"] = true;
 				d["tier"] = tier;
 				pb->result = op_value(d);
-			} else if (policy == "deny") {
+			} else if (policy == "deny" || policy == "write") {
 				Dictionary d;
 				d["granted"] = false;
 				d["tier"] = tier;
-				d["policy"] = "deny";
+				d["policy"] = policy;
+				pb->result = op_value(d);
+			} else if (policy == "off") {
+				// Dormant group: classes are already callable; nothing to grant.
+				Dictionary d;
+				d["granted"] = true;
+				d["tier"] = tier;
+				d["policy"] = "off";
 				pb->result = op_value(d);
 			} else if (tier_request_cb) {
 				{

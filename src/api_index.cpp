@@ -242,6 +242,54 @@ bool ApiIndex::load(const String &allowlist_path) {
 // refresh() so the existing pump poll picks changes up within ~100ms. We
 // compare file content rather than mtime: some filesystems report whole-second
 // timestamps, so a quick successive edit can keep the same mtime.
+// Merge the policy file's group declarations into one map:
+//   name -> {classes: [...], policy: "deny"|"write"|"ask"|"allow"|"off", protected?: true}
+// Sources, in precedence order: `groups` (unified), `deny_groups` (earlier
+// iteration of this schema: array means deny, object means {classes, policy}),
+// and legacy `tiers` + `tier_policy` (ask/allow/deny -> tier states).
+static Dictionary parse_groups(const Dictionary &cfg) {
+	Dictionary out;
+	Dictionary legacy_policy = cfg.get("tier_policy", Dictionary());
+	String fallback = String(legacy_policy.get("*", "ask"));
+	auto put = [&](const String &name, const Variant &classes_v, const String &policy, bool prot, bool override_entry, const String &why = "") {
+		if (name.is_empty() || (!override_entry && out.has(name))) return;
+		Dictionary g;
+		Array cls;
+		if (classes_v.get_type() == Variant::ARRAY) cls = classes_v;
+		g["classes"] = cls;
+		g["policy"] = policy;
+		if (prot) g["protected"] = true;
+		if (!why.is_empty()) g["why"] = why;
+		out[name] = g;
+	};
+	Dictionary tiers_cfg = cfg.get("tiers", Dictionary());
+	for (const Variant &t : tiers_cfg.keys()) {
+		String p = String(legacy_policy.get(t, fallback));
+		put(String(t), tiers_cfg[t], (p == "allow" || p == "deny") ? p : String("ask"), false, false);
+	}
+	Dictionary deny_groups = cfg.get("deny_groups", Dictionary());
+	for (const Variant &gname : deny_groups.keys()) {
+		Variant v = deny_groups[gname];
+		if (v.get_type() == Variant::DICTIONARY) {
+			Dictionary d = v;
+			put(String(gname), d.get("classes", Array()), String(d.get("policy", "deny")), (bool)d.get("protected", false), false, String(d.get("_why", d.get("why", ""))));
+		} else {
+			put(String(gname), v, "deny", false, false);
+		}
+	}
+	Dictionary groups = cfg.get("groups", Dictionary());
+	for (const Variant &gname : groups.keys()) {
+		Variant v = groups[gname];
+		if (v.get_type() == Variant::DICTIONARY) {
+			Dictionary d = v;
+			put(String(gname), d.get("classes", Array()), String(d.get("policy", "deny")), (bool)d.get("protected", false), true, String(d.get("_why", d.get("why", ""))));
+		} else {
+			put(String(gname), v, "deny", false, true);
+		}
+	}
+	return out;
+}
+
 void ApiIndex::reload_policy() {
 	if (policy_path.is_empty()) return;
 	String text = FileAccess::get_file_as_string(policy_path);
@@ -249,40 +297,66 @@ void ApiIndex::reload_policy() {
 	Ref<JSON> j;
 	j.instantiate();
 	if (j->parse(text) != OK || j->get_data().get_type() != Variant::DICTIONARY) {
+		last_reload_status = "parse_error";
 		uint64_t now = Time::get_singleton()->get_ticks_msec();
 		if (now - last_policy_error >= 5000) {
 			last_policy_error = now;
 			UtilityFunctions::printerr("[godot-cm] policy reload failed, keeping prior policy: ", policy_path);
+			if (policy_reload_cb) policy_reload_cb(false);
 		}
 		return;
 	}
 	Variant reloaded = j->get_data();
 	if (reloaded.stringify().hash() == policy_hash) return;
 	policy_hash = reloaded.stringify().hash();
-	policy_document = reloaded;
 	Dictionary rcfg = reloaded;
-	// The file is the source of truth: re-apply declared policies and grants.
-	// Explicit per-tier policies get the dock's semantics (allow unlocks,
-	// ask/deny relocks); tiers not named in the file keep session grants.
+	// File wins — but only for entries whose declared policy actually changed:
+	// an unrelated file edit must not wipe session grants on untouched groups.
+	Dictionary old_groups = parse_groups(policy_document);
+	policy_document = reloaded;
 	tier_policy = rcfg.get("tier_policy", Dictionary());
+	Dictionary old_legacy = policy_document.get("tier_policy", Dictionary());
 	for (const Variant &t : tier_policy.keys()) {
 		String tier = t;
 		if (tier == "*") continue;
 		String p = String(tier_policy[t]);
+		String before = String(old_legacy.get(t, ""));
+		if (p == before) continue;
 		if (p == "allow") {
 			unlocked[tier] = true;
 		} else {
 			unlocked.erase(tier);
 		}
 	}
+	// The file's tier_policy key is legacy-only and usually absent, so the
+	// assignment above empties the map: re-seed every declared group policy
+	// immediately or policy_of() falls back to "ask" for untouched groups.
+	// The rebuild refills the same map; here only `unlocked` stays
+	// change-scoped so file edits don't wipe session grants on other groups.
+	Dictionary rcfg_groups = parse_groups(rcfg);
+	for (const Variant &gname : rcfg_groups.keys()) {
+		String p = String(((Dictionary)rcfg_groups[gname]).get("policy", ""));
+		tier_policy[gname] = p;
+		String before = old_groups.has(gname) ? String(((Dictionary)old_groups[gname]).get("policy", "")) : "";
+		if (p == before) continue;
+		if (p == "allow") {
+			unlocked[gname] = true;
+		} else {
+			unlocked.erase(gname);
+		}
+	}
 	Array pre = rcfg.get("unlocked_tiers", Array());
 	for (int i = 0; i < pre.size(); i++) unlocked[pre[i]] = true;
 	if (rcfg.get("auto_grant_tiers", false)) {
-		Dictionary rcfg_tiers = rcfg.get("tiers", Dictionary());
-		for (const Variant &t : rcfg_tiers.keys()) unlocked[t] = true;
+		for (const Variant &gname : rcfg_groups.keys()) {
+			if (String(((Dictionary)rcfg_groups[gname]).get("policy", "")) == "ask") unlocked[gname] = true;
+		}
 	}
 	dirty = true;
+	last_policy_reload = Time::get_singleton()->get_ticks_msec();
+	last_reload_status = "applied";
 	UtilityFunctions::print("[godot-cm] policy reloaded: ", policy_path);
+	if (policy_reload_cb) policy_reload_cb(true);
 }
 
 void ApiIndex::invalidate(bool native) {
@@ -445,15 +519,20 @@ bool ApiIndex::refresh(bool reconcile) {
 	// Denylist mode: index everything except denied classes. Meta-methods
 	// that bypass member checks are always blocked, no matter the config.
 	Dictionary deny_classes;
+	Dictionary deny_write;
 	Dictionary deny_global;
 	Dictionary deny_members;
 	Dictionary restrict_cfg;
 	for (const char *name : {"McpService", "SpikeRunner", "BridgePump"}) deny_classes[name] = true;
 	tiered = Dictionary();
 	tier_classes = Dictionary();
+	group_protected = Dictionary();
+	class_group = Dictionary();
 	if (deny_mode) {
 		Array dc = cfg.get("deny_classes", Array());
 		for (int i = 0; i < dc.size(); i++) deny_classes[dc[i]] = true;
+		Array dwc = cfg.get("deny_write_classes", Array());
+		for (int i = 0; i < dwc.size(); i++) deny_write[dwc[i]] = true;
 		Array dg = cfg.get("deny_global_members", Array());
 		for (int i = 0; i < dg.size(); i++) deny_global[dg[i]] = true;
 		for (const char *m : {"call", "callv", "callp", "call_deferred",
@@ -469,26 +548,86 @@ bool ApiIndex::refresh(bool reconcile) {
 		denied_global = deny_global;
 		denied_members = deny_members;
 		restricted = restrict_cfg;
-		// Tiers: classes that index normally but stay inert until unlocked.
-		Dictionary tiers_cfg = cfg.get("tiers", Dictionary());
-		for (const Variant &t : tiers_cfg.keys()) {
-			String tier = t;
-			Array cls_list = tiers_cfg[t];
-			tier_classes[tier] = cls_list;
+		// Unified permission groups: one named class set + one state each.
+		// deny = blocked entirely, write = reads only, ask/allow = tier gate,
+		// off = dormant. deny wins when a class lands in several groups.
+		Dictionary groups = parse_groups(cfg);
+		Dictionary group_states;
+		for (const Variant &gname : groups.keys()) {
+			Dictionary g = groups[gname];
+			String name = gname;
+			String policy = String(g.get("policy", "deny"));
+			if (policy != "deny" && policy != "write" && policy != "ask" && policy != "allow" && policy != "off") {
+				policy = "deny";
+			}
+			group_states[name] = policy;
+			if ((bool)g.get("protected", false)) group_protected[name] = true;
+			if (g.has("why")) group_why[name] = g["why"];
+			Array cls_list = g.get("classes", Array());
+			tier_classes[name] = cls_list;
 			for (int i = 0; i < cls_list.size(); i++) {
-				tiered[cls_list[i]] = tier;
+				String cls = cls_list[i];
+				// Most restrictive gate wins across groups.
+				String existing = String(class_group.get(cls, ""));
+				String existing_policy = existing.is_empty() ? "" : String(group_states.get(existing, tier_policy.get(existing, "")));
+				if (existing_policy == "deny") continue;
+				if (policy == "deny") {
+					deny_classes[cls] = true;
+					deny_write.erase(cls);
+					tiered.erase(cls);
+					class_group[cls] = name;
+				} else if (policy == "write") {
+					if (existing_policy != "deny") {
+						deny_write[cls] = true;
+						if (existing_policy != "ask" && existing_policy != "allow") {
+							tiered.erase(cls);
+							class_group[cls] = name;
+						}
+					}
+				} else if (policy == "off") {
+					if (existing.is_empty()) class_group[cls] = name;
+				} else { // ask / allow: tier gate
+					tiered[cls] = name;
+					deny_write.erase(cls);
+				}
+				if (!deny_classes.has(cls) && String(class_group.get(cls, "")).is_empty()) class_group[cls] = name;
 			}
 		}
-		if (!loaded) tier_policy = cfg.get("tier_policy", Dictionary());
-		// Persistent grants + trust mode: no dialog, no friction.
 		if (!loaded) {
+			tier_policy = cfg.get("tier_policy", Dictionary());
+			// Group policies feed the same map so policy_of() keeps working.
+			for (const Variant &gname : group_states.keys()) tier_policy[gname] = group_states[gname];
 			Array pre = cfg.get("unlocked_tiers", Array());
 			for (int i = 0; i < pre.size(); i++) unlocked[pre[i]] = true;
 			if (cfg.get("auto_grant_tiers", false)) {
-				for (const Variant &t : tier_classes.keys()) unlocked[t] = true;
+				for (const Variant &gname : group_states.keys()) {
+					if (String(group_states[gname]) == "ask") unlocked[gname] = true;
+				}
+			}
+		} else {
+			for (const Variant &gname : group_states.keys()) tier_policy[gname] = group_states[gname];
+		}
+		// "allow" groups grant silently; no prompt ever.
+		for (const Variant &gname : group_states.keys()) {
+			if (String(group_states[gname]) == "allow") unlocked[gname] = true;
+		}
+		// Shipped defaults feed the dock's per-group reset button.
+		group_default.clear();
+		if (!policy_path.is_empty()) {
+			String dtext = FileAccess::get_file_as_string(policy_path.get_base_dir().path_join("allowlist.default.json"));
+			if (!dtext.is_empty()) {
+				Ref<JSON> dj;
+				dj.instantiate();
+				if (dj->parse(dtext) == OK && dj->get_data().get_type() == Variant::DICTIONARY) {
+					Dictionary dg = parse_groups(dj->get_data());
+					for (const Variant &dname : dg.keys()) {
+						group_default[dname] = String(((Dictionary)dg[dname]).get("policy", ""));
+					}
+				}
 			}
 		}
 	}
+	denied_write = deny_write;
 	Array untracked_notice;
 	untracked_notice.push_back("Native and project-script execution without undo or rollback; code may have arbitrary side effects, including file and network access.");
 	tier_classes["untracked"] = untracked_notice;
@@ -859,8 +998,10 @@ void ApiIndex::unlock_tier(const String &tier) {
 }
 
 void ApiIndex::unlock_all_tiers() {
+	// Auto-grant covers "ask" groups only: deny/write policies are hard rules,
+	// not prompts, and unlocking them would silently punch the sandbox open.
 	for (const Variant &t : tier_classes.keys()) {
-		unlocked[t] = true;
+		if (policy_of(t) == "ask") unlocked[t] = true;
 	}
 	refresh_catalog();
 }
@@ -880,10 +1021,10 @@ Array ApiIndex::unlocked_tiers() const {
 
 String ApiIndex::policy_of(const String &tier) const {
 	String p = String(tier_policy.get(tier, tier_policy.get("*", "ask")));
-	if (p != "allow" && p != "deny") {
-		return "ask";
+	if (p == "allow" || p == "deny" || p == "write" || p == "off") {
+		return p;
 	}
-	return p;
+	return "ask";
 }
 
 void ApiIndex::set_tier_policy(const String &tier, const String &policy) {
@@ -1162,20 +1303,19 @@ Array ApiCatalog::find(const String &query) const {
 
 Dictionary ApiIndex::permissions_summary() const {
 	Dictionary out;
+	Array gs;
+	for (const Variant &t : tier_classes.keys()) {
+		String group = t;
+		gs.push_back(group_info(group));
+	}
+	out["groups"] = gs;
+	// "tiers" kept for older clients: the same entries, ask/allow policies only.
 	Array ts;
 	for (const Variant &t : tier_classes.keys()) {
-		String tier = t;
-		Dictionary td;
-		td["name"] = tier;
-		td["policy"] = policy_of(tier);
-		td["unlocked"] = unlocked.has(tier);
-		Array classes = tier_classes[tier];
-		td["class_count"] = classes.size();
-		Array examples;
-		for (int i = 0; i < classes.size() && i < 8; i++) {
-			examples.push_back(classes[i]);
-		}
-		td["class_examples"] = examples;
+		String group = t;
+		String policy = policy_of(group);
+		if (policy == "deny" || policy == "write" || policy == "off") continue;
+		Dictionary td = group_info(group);
 		ts.push_back(td);
 	}
 	out["tiers"] = ts;
@@ -1185,13 +1325,19 @@ Dictionary ApiIndex::permissions_summary() const {
 	}
 	denied.sort();
 	out["denied_classes"] = denied;
+	Array write_denied;
+	for (const Variant &c : denied_write.keys()) {
+		write_denied.push_back(c);
+	}
+	write_denied.sort();
+	out["denied_write_classes"] = write_denied;
 	Array global;
 	for (const Variant &m : denied_global.keys()) {
 		global.push_back(m);
 	}
 	global.sort();
 	out["denied_members_global"] = global;
-	out["note"] = "Denied classes/members are never unlockable; tiered classes unlock via godot.requestTier(tier). Query a member with godot.permissions({class, member}).";
+	out["note"] = "Groups carry one policy: deny blocks everything, write allows reads only, ask prompts via godot.requestTier(name), allow grants silently, off is dormant. Query a member with godot.permissions({class, member}).";
 	return out;
 }
 
@@ -1213,15 +1359,33 @@ Dictionary ApiIndex::permission_info(const String &class_name, const String &mem
 			c = cdb ? cdb->get_parent_class(c) : "";
 		}
 	}
+	bool writes_denied = false;
+	if (denylist_mode && !class_denied) {
+		for (String c = cls; !c.is_empty();) {
+			if (denied_write.has(c)) {
+				writes_denied = true;
+				out["write_denied_on"] = c;
+				break;
+			}
+			c = cdb ? cdb->get_parent_class(c) : "";
+		}
+	}
 	out["class"] = cls;
 	out["class_allowed"] = !class_denied && index.has(cls);
+	out["writes_allowed"] = !class_denied && !writes_denied;
+	if (writes_denied) {
+		out["write_reason"] = "write_denied";
+	}
 	if (class_denied) {
 		out["reason"] = "class_denied";
+		String g = denied_group(cls);
+		if (!g.is_empty()) out["group"] = g;
 	}
 	if (!class_denied && tiered.has(cls)) {
 		String t = tiered[cls];
 		Dictionary td;
 		td["tier"] = t;
+		td["group"] = t;
 		td["locked"] = !unlocked.has(t);
 		td["policy"] = policy_of(t);
 		out["tier"] = td;
@@ -1273,6 +1437,206 @@ Dictionary ApiIndex::permission_info(const String &class_name, const String &mem
 		out["reason"] = out.has("tier") ? "tier_locked" : "member_not_indexed";
 	}
 	return out;
+}
+
+bool ApiIndex::class_denied(const String &class_name) const {
+	if (!denylist_mode) return false;
+	ClassDBSingleton *cdb = ClassDBSingleton::get_singleton();
+	for (String c = class_name; !c.is_empty();) {
+		if (denied_classes.has(c)) return true;
+		c = cdb ? cdb->get_parent_class(c) : "";
+	}
+	return false;
+}
+
+bool ApiIndex::class_write_denied(const String &class_name) const {
+	if (!denylist_mode) return false;
+	ClassDBSingleton *cdb = ClassDBSingleton::get_singleton();
+	for (String c = class_name; !c.is_empty();) {
+		if (denied_write.has(c)) return true;
+		c = cdb ? cdb->get_parent_class(c) : "";
+	}
+	return false;
+}
+
+bool ApiIndex::member_denied_on(const String &class_name, const String &member, String &denied_on) const {
+	ClassDBSingleton *cdb = ClassDBSingleton::get_singleton();
+	for (String c = class_name; !c.is_empty();) {
+		if (denied_members.has(c) && ((Array)denied_members[c]).has(member)) {
+			denied_on = c;
+			return true;
+		}
+		c = cdb ? cdb->get_parent_class(c) : "";
+	}
+	return false;
+}
+
+bool ApiIndex::global_member_denied(const String &member) const {
+	return denied_global.has(member);
+}
+
+String ApiIndex::denied_group(const String &class_name) const {
+	ClassDBSingleton *cdb = ClassDBSingleton::get_singleton();
+	for (String c = class_name; !c.is_empty();) {
+		if (class_group.has(c) && denied_classes.has(c)) return class_group[c];
+		c = cdb ? cdb->get_parent_class(c) : "";
+	}
+	return "";
+}
+
+bool ApiIndex::group_is_protected(const String &group) const {
+	return group_protected.has(group);
+}
+
+Array ApiIndex::groups() const {
+	return tier_classes.keys();
+}
+
+Dictionary ApiIndex::group_info(const String &group) const {
+	Dictionary td;
+	td["name"] = group;
+	td["policy"] = policy_of(group);
+	td["protected"] = group_protected.has(group);
+	td["unlocked"] = unlocked.has(group);
+	Array classes = tier_classes.get(group, Array());
+	td["class_count"] = classes.size();
+	if (group_why.has(group)) td["why"] = group_why[group];
+	if (group_default.has(group)) td["default"] = group_default[group];
+	Array examples;
+	for (int i = 0; i < classes.size() && i < 8; i++) examples.push_back(classes[i]);
+	td["class_examples"] = examples;
+	return td;
+}
+
+bool ApiIndex::group_has_state(const String &group, const String &state) const {
+	return policy_of(group) == state;
+}
+
+Dictionary ApiIndex::policy_status() const {
+	Dictionary out;
+	out["path"] = policy_path;
+	out["status"] = last_reload_status;
+	out["last_reload_msec"] = (int64_t)last_policy_reload;
+	return out;
+}
+
+// Dock edits persist through the file, not around it: rewrite only the
+// policy field of the named group, then let the normal reload path re-apply
+// (file wins, idempotent). Class lists stay file-authoritative.
+bool ApiIndex::save_group_policy(const String &group, const String &state) {
+	if (policy_path.is_empty()) return false;
+	if (state != "deny" && state != "write" && state != "ask" && state != "allow" && state != "off") return false;
+	Dictionary parsed = parse_groups(policy_document);
+	if (!parsed.has(group)) return false;
+	if (group_protected.has(group) && (state == "ask" || state == "allow")) return false;
+	// Merge against the on-disk document, not the cached copy: a second dock
+	// edit can land before the next reload picks up the first one, and
+	// duplicating the stale cache would silently revert it.
+	Dictionary doc = policy_document.duplicate(true);
+	String on_disk = FileAccess::get_file_as_string(policy_path);
+	if (!on_disk.is_empty()) {
+		Ref<JSON> disk_j;
+		disk_j.instantiate();
+		if (disk_j->parse(on_disk) == OK && disk_j->get_data().get_type() == Variant::DICTIONARY) {
+			doc = disk_j->get_data();
+		}
+	}
+	Dictionary groups = doc.get("groups", Dictionary());
+	Dictionary g = groups.get(group, Dictionary());
+	// Legacy files without a `groups` key: materialize the parsed entry so the
+	// dock's edit survives the next load under the unified schema.
+	if (g.is_empty()) {
+		Dictionary src = parsed[group];
+		g["classes"] = src.get("classes", Array());
+	}
+	g["policy"] = state;
+	if ((bool)((Dictionary)parsed[group]).get("protected", false)) g["protected"] = true;
+	groups[group] = g;
+	doc["groups"] = groups;
+	Ref<JSON> j;
+	j.instantiate();
+	String text = j->stringify(doc, "\t");
+	Ref<FileAccess> f = FileAccess::open(policy_path, FileAccess::WRITE);
+	if (f.is_null()) return false;
+	f->store_string(text);
+	f->close();
+	// Apply immediately through the reload path; the pump's next reload sees
+	// the same hash and skips.
+	reload_policy();
+	return true;
+}
+
+// Restore every group policy to the shipped defaults: allowlist.default.json
+// next to the live file supplies the reference policies; user class lists and
+// groups absent from the defaults are left untouched.
+bool ApiIndex::reset_group_policies() {
+	if (policy_path.is_empty()) return false;
+	String default_path = policy_path.get_base_dir().path_join("allowlist.default.json");
+	String text = FileAccess::get_file_as_string(default_path);
+	if (text.is_empty()) return false;
+	Ref<JSON> j;
+	j.instantiate();
+	if (j->parse(text) != OK || j->get_data().get_type() != Variant::DICTIONARY) return false;
+	Dictionary defaults = parse_groups(j->get_data());
+	String on_disk = FileAccess::get_file_as_string(policy_path);
+	Dictionary doc;
+	if (!on_disk.is_empty()) {
+		Ref<JSON> disk_j;
+		disk_j.instantiate();
+		if (disk_j->parse(on_disk) == OK && disk_j->get_data().get_type() == Variant::DICTIONARY) doc = disk_j->get_data();
+	}
+	if (doc.is_empty()) doc = policy_document.duplicate(true);
+	Dictionary groups = doc.get("groups", Dictionary());
+	for (const Variant &gname : defaults.keys()) {
+		Dictionary src = defaults[gname];
+		Dictionary g = groups.get(gname, Dictionary());
+		if (g.is_empty()) g["classes"] = src.get("classes", Array());
+		g["policy"] = src.get("policy", "deny");
+		if ((bool)src.get("protected", false)) g["protected"] = true;
+		groups[gname] = g;
+	}
+	doc["groups"] = groups;
+	Ref<JSON> out_j;
+	out_j.instantiate();
+	Ref<FileAccess> f = FileAccess::open(policy_path, FileAccess::WRITE);
+	if (f.is_null()) return false;
+	f->store_string(out_j->stringify(doc, "\t"));
+	f->close();
+	reload_policy();
+	return true;
+}
+
+// Trust mode: set groups to "allow" in the file. Protected groups
+// (execution/process/interop) require include_protected — that enables
+// arbitrary code execution and disables the sandbox entirely.
+bool ApiIndex::allow_all_groups(bool include_protected) {
+	if (policy_path.is_empty()) return false;
+	Dictionary parsed = parse_groups(policy_document);
+	String on_disk = FileAccess::get_file_as_string(policy_path);
+	Dictionary doc;
+	if (!on_disk.is_empty()) {
+		Ref<JSON> disk_j;
+		disk_j.instantiate();
+		if (disk_j->parse(on_disk) == OK && disk_j->get_data().get_type() == Variant::DICTIONARY) doc = disk_j->get_data();
+	}
+	if (doc.is_empty()) doc = policy_document.duplicate(true);
+	Dictionary groups = doc.get("groups", Dictionary());
+	for (const Variant &gname : parsed.keys()) {
+		if (!include_protected && group_protected.has(gname)) continue;
+		Dictionary g = groups.get(gname, Dictionary());
+		if (g.is_empty()) g["classes"] = ((Dictionary)parsed[gname]).get("classes", Array());
+		g["policy"] = "allow";
+		groups[gname] = g;
+	}
+	doc["groups"] = groups;
+	Ref<JSON> out_j;
+	out_j.instantiate();
+	Ref<FileAccess> f = FileAccess::open(policy_path, FileAccess::WRITE);
+	if (f.is_null()) return false;
+	f->store_string(out_j->stringify(doc, "\t"));
+	f->close();
+	reload_policy();
+	return true;
 }
 
 } // namespace godot_cm

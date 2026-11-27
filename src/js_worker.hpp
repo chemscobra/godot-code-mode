@@ -26,6 +26,7 @@ struct ExecRequest {
 	int64_t timeout_ms = 0;    // <=0: mode default (5s read / 60s write)
 	std::shared_ptr<std::atomic<bool>> cancel;  // set by notifications/cancelled
 	std::shared_ptr<TxState> tx;                // per-request transaction state
+	std::shared_ptr<std::atomic<int64_t>> deadline_ext; // request_tier extends the worker-side wait (ms)
 };
 
 // Bounded JS execution on a dedicated worker thread (design D2/D3).
