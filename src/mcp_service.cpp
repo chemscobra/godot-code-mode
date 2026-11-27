@@ -27,7 +27,7 @@ namespace godot_cm {
 
 static const char *PROTOCOL_VERSION = "2025-11-25";
 static const char *SERVER_NAME = "godot-cm";
-static const char *SERVER_VERSION = "0.3.2";
+static const char *SERVER_VERSION = "0.3.3";
 
 void McpService::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("register_plugin_method", "name", "provider", "definition"), &McpService::register_plugin_method);
@@ -157,6 +157,12 @@ Variant McpService::handle_initialize(const Variant &id, const Dictionary &param
 	info["name"] = SERVER_NAME;
 	info["version"] = SERVER_VERSION;
 	result["serverInfo"] = info;
+	{
+		std::lock_guard<std::mutex> lock(session_mutex);
+		// Header stays authoritative; the body copy serves clients that
+		// cannot read response headers.
+		result["sessionId"] = String(session_token.c_str());
+	}
 
 	Dictionary response;
 	response["jsonrpc"] = "2.0";
@@ -214,6 +220,8 @@ Variant McpService::handle_tools_list(const Variant &id) {
 			"Higher-level helpers: godot.build({type,name,props,children},{parent}) builds a node tree in one call with automatic owners; "
 			"godot.scene.new(path) creates and opens a scene, godot.scene.reload(path?) reopens it, godot.scene.tree() inspects it, godot.scene.run()/stop() control playback; "
 			"godot.attachScript(node,'res://x.gd') assigns a non-@tool script undoably; "
+			"godot.createScript('res://x.gd',source) writes the file undoably first. "
+			"External actions (pluginAction, godot.scene.new/reload/run) must run in their own execute call with no other writes. "
 			"godot.permissions({class,member}) explains why a call is allowed or denied; api.example(type) returns a wire value for tagged engine types.";
 	Dictionary exec_schema;
 	exec_schema["type"] = "object";

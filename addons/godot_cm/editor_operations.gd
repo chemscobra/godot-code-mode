@@ -33,6 +33,16 @@ func register(service: RefCounted) -> void:
 		"tier": "filesystem",
 		"description": "Undoably assign a non-@tool .gd script to a node. Args: node (Node handle), path (res://*.gd).",
 	})
+	service.register_plugin_method("editor.create_script", self, {
+		"method": "create_script", "capture": "capture_created_script", "restore": "restore_created_script",
+		"tier": "filesystem",
+		"description": "Undoably write a non-@tool .gd script file. Args: path (res://*.gd), source (String), overwrite (bool, default false).",
+		"input_schema": {"type": "object", "properties": {
+			"path": {"type": "string", "description": "Canonical res:// path ending in .gd"},
+			"source": {"type": "string", "description": "Full GDScript source. @tool scripts are refused."},
+			"overwrite": {"type": "boolean", "default": false},
+		}, "required": ["path", "source"]},
+	})
 
 func _fail(message: String) -> Dictionary:
 	return {"ok": false, "message": message}
@@ -166,6 +176,60 @@ func restore_script(snapshot: Dictionary) -> bool:
 		return false
 	node.set_script(snapshot.get("script"))
 	EditorInterface.mark_scene_as_unsaved()
+	return true
+
+func _has_tool_annotation(source: String) -> bool:
+	for line in source.split("\n"):
+		if line.strip_edges().begins_with("@tool"):
+			return true
+	return false
+
+func _write_script(path: String, source: String) -> bool:
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	if f == null:
+		return false
+	f.store_string(source)
+	f.close()
+	return true
+
+func capture_created_script(args: Dictionary) -> Dictionary:
+	var path := String(args.get("path", ""))
+	if not _script_path(path):
+		return _fail("A canonical res:// .gd path is required")
+	var state := {"path": path, "existed": FileAccess.file_exists(path), "prior": ""}
+	if state.existed:
+		state.prior = FileAccess.get_file_as_string(path)
+	return {"ok": true, "state": state}
+
+func create_script(args: Dictionary) -> Dictionary:
+	var path := String(args.get("path", ""))
+	if not _script_path(path):
+		return _fail("A canonical res:// .gd path is required")
+	if not args.has("source") or not args["source"] is String:
+		return _fail("A string source is required")
+	var source := String(args["source"])
+	if _has_tool_annotation(source):
+		return _fail("Refusing @tool scripts: they run editor code and are not rollbackable")
+	var existed := FileAccess.file_exists(path)
+	if existed and not bool(args.get("overwrite", false)):
+		return _fail("Refusing to overwrite an existing file; pass overwrite: true")
+	if DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(path.get_base_dir())) != OK:
+		return _fail("Could not create the script directory")
+	if not _write_script(path, source):
+		return _fail("Could not write the script file: %s" % error_string(FileAccess.get_open_error()))
+	EditorInterface.get_resource_filesystem().update_file(path)
+	return {"ok": true, "result": {"path": path, "overwrote": existed}}
+
+func restore_created_script(snapshot: Dictionary) -> bool:
+	var path := String(snapshot.get("path", ""))
+	if path.is_empty():
+		return false
+	if bool(snapshot.get("existed", false)):
+		if not _write_script(path, String(snapshot.get("prior", ""))):
+			return false
+	elif FileAccess.file_exists(path):
+		DirAccess.remove_absolute(ProjectSettings.globalize_path(path))
+	EditorInterface.get_resource_filesystem().update_file(path)
 	return true
 
 func capture_watch(args: Dictionary) -> Dictionary:

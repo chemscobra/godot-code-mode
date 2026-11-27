@@ -11,6 +11,7 @@
 #include <godot_cpp/classes/resource_loader.hpp>
 #include <godot_cpp/classes/script.hpp>
 #include <godot_cpp/classes/node.hpp>
+#include <godot_cpp/classes/time.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 
 using namespace godot;
@@ -229,9 +230,59 @@ bool ApiIndex::load(const String &allowlist_path) {
 		UtilityFunctions::printerr("[godot-cm] failed to load api index or allowlist");
 		return false;
 	}
+	policy_path = allowlist_path;
+	policy_hash = allow_v.stringify().hash();
 	policy_document = allow_v;
 	loaded = false;
 	return refresh();
+}
+
+// The catalog caches policy_document in memory; without this reload edits to
+// the policy file would only apply on plugin restart. Called at the top of
+// refresh() so the existing pump poll picks changes up within ~100ms. We
+// compare file content rather than mtime: some filesystems report whole-second
+// timestamps, so a quick successive edit can keep the same mtime.
+void ApiIndex::reload_policy() {
+	if (policy_path.is_empty()) return;
+	String text = FileAccess::get_file_as_string(policy_path);
+	if (text.is_empty()) return;
+	Ref<JSON> j;
+	j.instantiate();
+	if (j->parse(text) != OK || j->get_data().get_type() != Variant::DICTIONARY) {
+		uint64_t now = Time::get_singleton()->get_ticks_msec();
+		if (now - last_policy_error >= 5000) {
+			last_policy_error = now;
+			UtilityFunctions::printerr("[godot-cm] policy reload failed, keeping prior policy: ", policy_path);
+		}
+		return;
+	}
+	Variant reloaded = j->get_data();
+	if (reloaded.stringify().hash() == policy_hash) return;
+	policy_hash = reloaded.stringify().hash();
+	policy_document = reloaded;
+	Dictionary rcfg = reloaded;
+	// The file is the source of truth: re-apply declared policies and grants.
+	// Explicit per-tier policies get the dock's semantics (allow unlocks,
+	// ask/deny relocks); tiers not named in the file keep session grants.
+	tier_policy = rcfg.get("tier_policy", Dictionary());
+	for (const Variant &t : tier_policy.keys()) {
+		String tier = t;
+		if (tier == "*") continue;
+		String p = String(tier_policy[t]);
+		if (p == "allow") {
+			unlocked[tier] = true;
+		} else {
+			unlocked.erase(tier);
+		}
+	}
+	Array pre = rcfg.get("unlocked_tiers", Array());
+	for (int i = 0; i < pre.size(); i++) unlocked[pre[i]] = true;
+	if (rcfg.get("auto_grant_tiers", false)) {
+		Dictionary rcfg_tiers = rcfg.get("tiers", Dictionary());
+		for (const Variant &t : rcfg_tiers.keys()) unlocked[t] = true;
+	}
+	dirty = true;
+	UtilityFunctions::print("[godot-cm] policy reloaded: ", policy_path);
 }
 
 void ApiIndex::invalidate(bool native) {
@@ -246,6 +297,7 @@ void ApiIndex::invalidate(bool native) {
 bool ApiIndex::refresh(bool reconcile) {
 	PerfScope cost(PerfMetric::CATALOG_NS);
 	Performance::add(PerfMetric::REFRESH_CALLS);
+	reload_policy();
 	if (loaded && !dirty && !reconcile) {
 		Performance::add(PerfMetric::CACHE_HITS);
 		return true;
@@ -680,7 +732,7 @@ declare interface GodotTypeHelp extends GodotTypeDescriptor { category: string; 
 declare interface GodotValueInfo { type: string; variant_type: number; size: number; readable: boolean; fields: string[]; accounted_bytes: number; retained_references: number; retained_accounted_bytes: number; reference_limit: number; accounted_byte_limit: number; }
 declare interface GodotValuePage { type: string; variant_type: number; offset: number; total: number; count: number; next_offset: number | null; truncated: boolean; items?: unknown[]; entries?: { key: unknown; value: unknown }[]; fields?: Record<string, unknown>; }
 declare interface GodotDiagnostic { code: string; message: string; phase: string; operation?: string; class?: string; member?: string; argument?: number; path?: string; expected?: string; received?: string; batch_index?: number; source?: { line?: number; column?: number; stack?: string; stack_truncated?: boolean }; omitted_characters?: number; }
-declare interface GodotExecutionResult { ok: boolean; result: unknown; diagnostics: GodotDiagnostic[]; changes: unknown[]; mode: "read" | "write" | "untracked"; rollback_supported: boolean; effects: { op: string; class: string; member: string; status: string; rollbackable: false }[]; partial: boolean; checkpoints: { name: string; value: unknown }[]; truncated: boolean; result_omitted?: boolean; effects_omitted?: number; changes_omitted?: number; diagnostics_omitted?: number; }
+declare interface GodotExecutionResult { ok: boolean; result: unknown; diagnostics: GodotDiagnostic[]; changes: unknown[]; mode: "read" | "write" | "untracked"; rollback_supported: boolean; effects: { op: string; class: string; member: string; status: string; rollbackable: false }[] | { counts: Record<string, number>; total: number }; partial: boolean; checkpoints: { name: string; value: unknown }[]; truncated: boolean; result_omitted?: boolean; effects_omitted?: number; changes_omitted?: number; diagnostics_omitted?: number; }
 declare function checkpoint(name: string, value: unknown): void;
 )TS";
 	for (int type = 0; type < Variant::VARIANT_MAX; type++) {
@@ -703,6 +755,7 @@ declare function checkpoint(name: string, value: unknown): void;
 	out += "\t\tproperties: (GodotTypeDescriptor & { name: string; read_mode: string; write_mode: string })[];\n";
 	out += "\t} | undefined;\n";
 	out += "\tfunction find(query: string): string[];\n";
+	out += "\tfunction helpers(): { name: string; signature: string; mode: string; tier: string; description: string; example: string }[];\n";
 	out += "\tfunction example(type: string): unknown; // wire literal accepted by godot.set/call for that Variant type\n";
 	out += "}\n\n";
 
@@ -755,15 +808,16 @@ declare function checkpoint(name: string, value: unknown): void;
 	out += "\tfunction requestTier(tier: string): Promise<{ granted: boolean; tier: string; already_unlocked?: boolean }>;\n";
 	out += "\tfunction unlockedTiers(): Promise<string[]>;\n";
 	out += "\tfunction attachScript(node: GodotHandle, path: string): Promise<unknown>;\n";
+	out += "\tfunction createScript(path: string, source: string, options?: { overwrite?: boolean }): Promise<unknown>;\n";
 	out += "\tfunction permissions(query?: { class?: string; member?: string }): Promise<unknown>;\n";
 	out += "\tfunction build(tree: { type: string; name?: string; props?: Record<string, unknown>; children?: unknown[] }, options?: { parent?: GodotHandle }): Promise<GodotHandle>;\n";
-	out += "\tnamespace scene {\n";
-	out += "\t\tfunction new(path: string, options?: { type?: string; name?: string }): Promise<GodotHandle>;\n";
-	out += "\t\tfunction reload(path?: string): Promise<GodotHandle>;\n";
-	out += "\t\tfunction tree(options?: { root?: GodotHandle; depth?: number; maxNodes?: number }): Promise<unknown>;\n";
-	out += "\t\tfunction run(): Promise<{ playing: boolean; scene?: string; console?: string }>;\n";
-	out += "\t\tfunction stop(): Promise<{ playing: boolean }>;\n";
-	out += "\t}\n";
+	out += "\tconst scene: {\n";
+	out += "\t\t\"new\"(path: string, options?: { type?: string; name?: string }): Promise<GodotHandle>;\n";
+	out += "\t\treload(path?: string): Promise<GodotHandle>;\n";
+	out += "\t\ttree(options?: { root?: GodotHandle; depth?: number; maxNodes?: number }): Promise<unknown>;\n";
+	out += "\t\trun(): Promise<{ playing: boolean; scene?: string; console?: string }>;\n";
+	out += "\t\tstop(): Promise<{ playing: boolean }>;\n";
+	out += "\t};\n";
 	out += "\tfunction batch(ops: {\n";
 	out += "\t\top: string; target?: GodotHandle; member?: string; prop?: string;\n";
 	out += "\t\tmethod?: string; class?: string; args?: any[]; value?: any;\n";

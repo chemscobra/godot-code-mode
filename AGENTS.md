@@ -16,3 +16,6 @@
 - Before finishing: rebuild both native binaries after source/version changes, run relevant integration tests, and run `git diff --check`. A successful Windows cross-build does not establish Windows runtime compatibility.
 - Activation tests exercise the shipped EditorPlugin, immediate disable/re-enable, pending/running status, occupied ports, and measure checkbox latency separately from service readiness. Startup discovers native APIs from ClassDB without parsing the static API dump; inherited signatures are shared within each immutable catalog.
 - Normal activation skips diagnostic spike checks and TypeScript generation. Opt in with `GODOT_CM_RUN_CHECKS=1` or `GODOT_CM_GENERATE_DTS=1` when developing; generated declarations are written to `user://godot_cm-api-surface.d.ts`.
+
+# Manual testing
+- `examples/demo-project/` is a deterministic, committed sandbox for manual MCP testing: `addons/godot_cm` is a symlink to the dev addon, plus vendored third-party plugins (Terrain3D v1.0.2 Linux-only binaries, PhantomCamera v0.12) for exercising non-builtin classes. Its `.godot/` and editor state are gitignored; do not use it in the automated suite — that fixture stays fully temporary.

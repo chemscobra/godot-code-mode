@@ -29,6 +29,9 @@ public:
 
 class ApiIndex : public ApiCatalog {
 	godot::Dictionary policy_document;
+	godot::String policy_path;
+	uint64_t policy_hash = 0;
+	uint64_t last_policy_error = 0;
 	godot::Dictionary observed_scripts;
 	godot::Dictionary script_descriptors;
 	godot::Array native_descriptors;
@@ -53,6 +56,7 @@ class ApiIndex : public ApiCatalog {
 	bool denylist_mode = false;
 	godot::Array script_metadata;
 	godot::Dictionary operation_metadata;
+	void reload_policy();
 
 public:
 	void publish_catalog(const godot::Array &scripts, const godot::Dictionary &operations);

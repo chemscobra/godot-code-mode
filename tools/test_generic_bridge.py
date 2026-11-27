@@ -83,7 +83,9 @@ extends EditorPlugin
 
 const Widget = preload("res://generic_widget.gd")
 const TypedConstructor = preload("res://typed_constructor.gd")
+const EditorOps = preload("res://addons/godot_cm/editor_operations.gd")
 var service: RefCounted
+var editor_ops: RefCounted
 var frame_capture_enabled := OS.get_environment("GENERIC_TEST_FRAMES") == "1"
 var frame_sampling := false
 var frame_done := false
@@ -126,6 +128,8 @@ func _start() -> void:
     service.tier_request.connect(_permission)
     service.set_tier_policy("untracked", "deny" if OS.get_environment("GENERIC_TEST_DENY") == "1" else "ask")
     service.set_tier_policy("filesystem", "ask")
+    editor_ops = EditorOps.new()
+    editor_ops.register(service)
     EditorInterface.open_scene_from_path("res://blank.tscn")
     await get_tree().process_frame
     await get_tree().process_frame
@@ -173,6 +177,7 @@ func _process(_delta: float) -> void:
     service.tier_request.connect(_permission)
     service.set_tier_policy("untracked", "ask")
     service.set_tier_policy("filesystem", "ask")
+    editor_ops.register(service)
     assert(_catalog_connections() == [1, 1, 1, 1, 1])
     FileAccess.open("res://restart_ready", FileAccess.WRITE).store_string("ready")
 
@@ -848,10 +853,9 @@ def exercise_checkpoints(client, node, widget):
 def exercise_collections(client, node, widget):
     vector = {"x": 1, "y": 2, "z": 3}
     array = client.value(f'return await godot.call({widget},"echo_typed_array",[{literal(vector)}]);', "untracked")
-    assert array["$t"] == "Array" and array["element_type"]["type"] == "Vector3", array
-    assert without_math_tags(array["values"]) == [vector], array
+    assert isinstance(array, list) and without_math_tags(array) == [vector], array
     empty = client.value(f'return await godot.call({widget},"echo_typed_array",[]);', "untracked")
-    assert empty["element_type"]["type"] == "Vector3" and empty["values"] == [], empty
+    assert empty == [], empty
     assert client.value(f'return await godot.call({widget},"untyped_echo",{literal(empty)});', "untracked") == empty
     typed_dictionary = {"$t": "Dictionary", "entries": [{"key": 1, "value": vector}]}
     dictionary = client.value(f'return await godot.call({widget},"echo_typed_dictionary",{literal(typed_dictionary)});', "untracked")
@@ -870,9 +874,9 @@ def exercise_collections(client, node, widget):
         failure = client.execute(f'return await godot.call({widget},"{method}",{literal(value)});', "untracked")
         assert not failure["ok"] and not failure["effects"], failure
     widget_array = client.value(f'return await godot.call({widget},"echo_widget_array",[{widget}]);', "untracked")
-    assert widget_array["element_type"]["type"] == "GenericMcpWidget", widget_array
+    assert isinstance(widget_array, list) and len(widget_array) == 1, widget_array
     replay = client.value(f'return await godot.call({widget},"echo_widget_array",{literal(widget_array)});', "untracked")
-    assert replay["element_type"] == widget_array["element_type"], replay
+    assert replay == widget_array, replay
     assert not client.execute(f'return await godot.call({widget},"echo_widget_array",[{literal(node)}]);', "untracked")["ok"]
     packed_invalid = {"PackedByteArray": [0, 256], "PackedInt32Array": [1, 2147483648], "PackedInt64Array": [1, 9007199254740992], "PackedFloat32Array": [1, 1e40], "PackedFloat64Array": [1, "wrong"], "PackedStringArray": ["ok", 1], "PackedVector2Array": [{"x": 1, "y": 2}, {"x": 1, "y": "wrong"}], "PackedVector3Array": [vector, {"x": 1, "y": 2}], "PackedColorArray": [{"r": 1, "g": 0, "b": 0}, {"r": 1, "g": "wrong", "b": 0}], "PackedVector4Array": [{"x": 1, "y": 2, "z": 3, "w": 4}, {"x": 1, "y": 2, "z": 3}]}
     for name, values in packed_invalid.items():
@@ -1134,6 +1138,65 @@ return echo.arguments[0].variant_type === 18 && echo.arguments[0].index === 0 &&
         assert not client.value(f'return await godot.call({handle}, "has_meta", "generic_test");')
         return
     assert grant["granted"]
+    tools = client.rpc("tools/list", {})
+    desc = next(t["description"] for t in tools["tools"] if t["name"] == "execute")
+    assert "own execute call" in desc, desc
+    assert client.initialized.get("sessionId") == client.session, client.initialized
+    summary = client.value('return await godot.permissions();')
+    assert summary["denied_classes"] and any(t["name"] == "untracked" for t in summary["tiers"]), summary
+    helpers = client.search('return api.helpers().map(function(h){return h.name;});')
+    for helper in ["godot.build", "godot.createScript", "godot.attachScript", "godot.pluginCall", "godot.scene.new", "checkpoint"]:
+        assert helper in helpers, helpers
+    children = client.value(f'return await godot.call({handle}, "get_children");', "untracked")
+    assert isinstance(children, list), children
+    raw = client.rpc("tools/call", {"name": "execute", "arguments": {"code": f'return await godot.call({handle}, "set_meta", "compact", 1);', "mode": "untracked"}})
+    compact = json.loads(raw["content"][0]["text"])
+    assert compact["ok"] and compact["effects"] == {"counts": {"call": 1}, "total": 1}, compact
+    # The addon directory is a symlink in non-isolated runs: preserve the
+    # policy file and always restore it, or the working tree stays dirty.
+    policy_file = project / "addons" / "godot_cm" / "allowlist.json"
+    policy_original = policy_file.read_text()
+    document = json.loads(policy_original)
+    try:
+        document["tier_policy"]["filesystem"] = "deny"
+        policy_file.write_text(json.dumps(document))
+        policy = ""
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            tiers = client.value('return await godot.permissions();')["tiers"]
+            policy = next((t["policy"] for t in tiers if t["name"] == "filesystem"), "")
+            if policy == "deny":
+                break
+            time.sleep(0.2)
+        assert policy == "deny", policy
+        assert not client.value('return await godot.requestTier("filesystem");')["granted"]
+        document["tier_policy"]["filesystem"] = "allow"
+        policy_file.write_text(json.dumps(document))
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if client.value('return await godot.requestTier("filesystem");')["granted"]:
+                break
+            time.sleep(0.2)
+        assert client.value('return await godot.requestTier("filesystem");')["granted"]
+    finally:
+        policy_file.write_text(policy_original)
+    # Wait for the restore reload: it relocks filesystem per the file's
+    # "ask" policy, then re-grant through the auto-accepting dialog hook.
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        tiers = client.value('return await godot.permissions();')["tiers"]
+        if next((t["policy"] for t in tiers if t["name"] == "filesystem"), "") == "ask":
+            break
+        time.sleep(0.2)
+    assert client.value('return await godot.requestTier("filesystem");')["granted"]
+    source = "extends Node3D\nfunc created_via_mcp() -> int:\n    return 1\n"
+    created = client.value(f'return await godot.createScript({literal("res://mcp_created.gd")}, {literal(source)});', "write")
+    assert created["path"] == "res://mcp_created.gd" and (project / "mcp_created.gd").read_text() == source, created
+    client.value(f'return await godot.attachScript({handle}, {literal("res://mcp_created.gd")});', "write")
+    refused = client.execute(f'return await godot.createScript({literal("res://tool.gd")}, {literal("@tool\textends Node\n")});', "write")
+    assert not refused["ok"], refused
+    rolled = client.execute(f'await godot.createScript({literal("res://rollback.gd")}, {literal("extends Node\n")}); throw new Error("rollback");', "write")
+    assert not rolled["ok"] and not (project / "rollback.gd").exists(), rolled
     exercise_passive_data(client, node)
     exercise_value_validation(client, node)
     assert client.value('''

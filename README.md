@@ -6,7 +6,7 @@ that awaits authorized editor operations. Supported edits can be grouped into
 one undoable editor action; an explicit `untracked` mode also permits calls
 whose effects cannot be rolled back.
 
-- Current addon version: **0.3.2** — [release notes](CHANGELOG.md)
+- Current addon version: **0.3.3** — [release notes](CHANGELOG.md)
 - Godot floor: **4.7** (validated on 4.7.2, linux-x86_64)
 - Platforms: Linux x86-64 tested; Windows x86-64 cross-built, runtime unverified.
 - MCP spec: **2025-11-25** (Streamable HTTP on loopback + stdio adapter)

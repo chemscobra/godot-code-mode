@@ -13,7 +13,7 @@ declare interface GodotTypeHelp extends GodotTypeDescriptor { category: string; 
 declare interface GodotValueInfo { type: string; variant_type: number; size: number; readable: boolean; fields: string[]; accounted_bytes: number; retained_references: number; retained_accounted_bytes: number; reference_limit: number; accounted_byte_limit: number; }
 declare interface GodotValuePage { type: string; variant_type: number; offset: number; total: number; count: number; next_offset: number | null; truncated: boolean; items?: unknown[]; entries?: { key: unknown; value: unknown }[]; fields?: Record<string, unknown>; }
 declare interface GodotDiagnostic { code: string; message: string; phase: string; operation?: string; class?: string; member?: string; argument?: number; path?: string; expected?: string; received?: string; batch_index?: number; source?: { line?: number; column?: number; stack?: string; stack_truncated?: boolean }; omitted_characters?: number; }
-declare interface GodotExecutionResult { ok: boolean; result: unknown; diagnostics: GodotDiagnostic[]; changes: unknown[]; mode: "read" | "write" | "untracked"; rollback_supported: boolean; effects: { op: string; class: string; member: string; status: string; rollbackable: false }[]; partial: boolean; checkpoints: { name: string; value: unknown }[]; truncated: boolean; result_omitted?: boolean; effects_omitted?: number; changes_omitted?: number; diagnostics_omitted?: number; }
+declare interface GodotExecutionResult { ok: boolean; result: unknown; diagnostics: GodotDiagnostic[]; changes: unknown[]; mode: "read" | "write" | "untracked"; rollback_supported: boolean; effects: { op: string; class: string; member: string; status: string; rollbackable: false }[] | { counts: Record<string, number>; total: number }; partial: boolean; checkpoints: { name: string; value: unknown }[]; truncated: boolean; result_omitted?: boolean; effects_omitted?: number; changes_omitted?: number; diagnostics_omitted?: number; }
 declare function checkpoint(name: string, value: unknown): void;
 declare interface GodotVector2 { $t?: "Vector2"; x: GodotFiniteFloat; y: GodotFiniteFloat; }
 declare interface GodotVector2i { $t?: "Vector2i"; x: GodotInt; y: GodotInt; }
@@ -41,6 +41,7 @@ declare namespace api {
 		properties: (GodotTypeDescriptor & { name: string; read_mode: string; write_mode: string })[];
 	} | undefined;
 	function find(query: string): string[];
+	function helpers(): { name: string; signature: string; mode: string; tier: string; description: string; example: string }[];
 	function example(type: string): unknown; // wire literal accepted by godot.set/call for that Variant type
 }
 
@@ -353360,15 +353361,16 @@ declare namespace godot {
 	function requestTier(tier: string): Promise<{ granted: boolean; tier: string; already_unlocked?: boolean }>;
 	function unlockedTiers(): Promise<string[]>;
 	function attachScript(node: GodotHandle, path: string): Promise<unknown>;
+	function createScript(path: string, source: string, options?: { overwrite?: boolean }): Promise<unknown>;
 	function permissions(query?: { class?: string; member?: string }): Promise<unknown>;
 	function build(tree: { type: string; name?: string; props?: Record<string, unknown>; children?: unknown[] }, options?: { parent?: GodotHandle }): Promise<GodotHandle>;
-	namespace scene {
-		function new(path: string, options?: { type?: string; name?: string }): Promise<GodotHandle>;
-		function reload(path?: string): Promise<GodotHandle>;
-		function tree(options?: { root?: GodotHandle; depth?: number; maxNodes?: number }): Promise<unknown>;
-		function run(): Promise<{ playing: boolean; scene?: string; console?: string }>;
-		function stop(): Promise<{ playing: boolean }>;
-	}
+	const scene: {
+		"new"(path: string, options?: { type?: string; name?: string }): Promise<GodotHandle>;
+		reload(path?: string): Promise<GodotHandle>;
+		tree(options?: { root?: GodotHandle; depth?: number; maxNodes?: number }): Promise<unknown>;
+		run(): Promise<{ playing: boolean; scene?: string; console?: string }>;
+		stop(): Promise<{ playing: boolean }>;
+	};
 	function batch(ops: {
 		op: string; target?: GodotHandle; member?: string; prop?: string;
 		method?: string; class?: string; args?: any[]; value?: any;

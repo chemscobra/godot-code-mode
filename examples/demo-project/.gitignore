@@ -1,0 +1,9 @@
+# Godot-regenerated state — deterministic sources only.
+.godot/
+.import/
+*.tmp
+*.translation
+
+# Local editor/session state
+godot_cm_session
+editor.log

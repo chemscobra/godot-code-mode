@@ -21,8 +21,9 @@ Each `execute` call SHALL enforce limits on total time, JS heap, bridge operatio
 `execute` SHALL return a structured result containing `ok` and `result`,
 with `diagnostics`, `changes`, `effects`, and `truncated` present only when
 non-empty or true. Changes SHALL be summarized as
-`{counts: {"Class.op": n}, total, status}` unless `verbose: true` restores
-the ordered per-op log. Errors SHALL carry a stable code, message, and
+`{counts: {"Class.op": n}, total, status}` and effects SHALL be summarized
+as `{counts: {"op|name": n}, total}`, unless `verbose: true` restores the
+ordered per-op logs. Errors SHALL carry a stable code, message, and
 phase, and SHALL never expose native pointers or secrets.
 
 #### Scenario: Successful execution shape
@@ -46,9 +47,13 @@ phase, and SHALL never expose native pointers or secrets.
 - **WHEN** an external action completed and later JavaScript fails
 - **THEN** `effects` still reports the action and its terminal status
 
+#### Scenario: Effects summarized by default
+- **WHEN** an `execute` call applies many operations without `verbose`
+- **THEN** `effects` is a per-op-kind count summary, not the ordered log
+
 #### Scenario: Verbose detail
 - **WHEN** `verbose: true` is passed
-- **THEN** `changes` carries the ordered per-operation log as before
+- **THEN** `changes` and `effects` carry the ordered per-operation logs
 
 ### Requirement: Fresh context per execution
 Each `execute` call SHALL run in a new JS context with no shared mutable state carried over from prior executions and no network, filesystem, or native-module bindings.

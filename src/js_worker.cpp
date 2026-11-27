@@ -146,6 +146,45 @@ JSValue variant_to_js(JSContext *ctx, const Variant &v) {
 		}
 		case Variant::DICTIONARY: {
 			Dictionary d = v;
+			// Unwrap collection envelopes into native JS values: Arrays
+			// become real arrays, string-keyed Dictionary entries become
+			// plain objects. Packed collections and non-string keys keep
+			// the $t envelope. Element type info remains available on the
+			// serialized wire envelope and via api.describe.
+			Variant tag = d.get("$t", Variant());
+			if (tag.get_type() == Variant::STRING) {
+				String t = tag;
+				Variant values_v = d.get("values", Variant());
+				if (values_v.get_type() == Variant::ARRAY && t == "Array") {
+					Array items = values_v;
+					JSValue arr = JS_NewArray(ctx);
+					for (int i = 0; i < items.size(); i++) {
+						JS_SetPropertyUint32(ctx, arr, i, variant_to_js(ctx, items[i]));
+					}
+					return arr;
+				}
+				if (t == "Dictionary" && d.get("entries", Variant()).get_type() == Variant::ARRAY && !d.has("key_type") && !d.has("value_type")) {
+					Array entries = d["entries"];
+					bool plain = true;
+					for (int i = 0; i < entries.size() && plain; i++) {
+						if (entries[i].get_type() != Variant::DICTIONARY) { plain = false; break; }
+						Variant k = ((Dictionary)entries[i]).get("key", Variant());
+						plain = k.get_type() == Variant::STRING && !String(k).begins_with("$") && !String(k).begins_with("__");
+					}
+					if (plain) {
+						JSValue obj = JS_NewObject(ctx);
+						for (int i = 0; i < entries.size(); i++) {
+							Dictionary e = entries[i];
+							String k = e["key"];
+							CharString ks = k.utf8();
+							JSAtom key = JS_NewAtomLen(ctx, ks.get_data(), ks.length());
+							JS_DefinePropertyValue(ctx, obj, key, variant_to_js(ctx, e["value"]), JS_PROP_C_W_E);
+							JS_FreeAtom(ctx, key);
+						}
+						return obj;
+					}
+				}
+			}
 			JSValue obj = JS_NewObject(ctx);
 			Array keys = d.keys();
 			for (int i = 0; i < keys.size(); i++) {
@@ -226,6 +265,102 @@ JSValue js_api_find(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) 
 		JS_FreeCString(ctx, n);
 	}
 	return variant_to_js(ctx, out);
+}
+
+// api.helpers() — static metadata for the JS convenience layer so agents can
+// discover signatures without reading addon source. Pure data: safe in both
+// search and execute contexts.
+static Array helper_metadata() {
+	Array out;
+	auto add = [&](const char *name, const char *signature, const char *mode,
+			const char *tier, const char *description, const char *example) {
+		Dictionary h;
+		h["name"] = name;
+		h["signature"] = signature;
+		h["mode"] = mode;
+		h["tier"] = tier;
+		h["description"] = description;
+		h["example"] = example;
+		out.push_back(h);
+	};
+	add("godot.call", "call(handleOrStaticClass, method, ...args) -> Promise<any>",
+			"read for const methods, write otherwise", "",
+			"Invoke an indexed method on a handle or static class. Results unwrap to native JS values.",
+			"await godot.call(node, 'set_name', 'Player')");
+	add("godot.get", "get(handle, prop) -> Promise<any>", "read", "",
+			"Read an indexed property.", "await godot.get(node, 'position')");
+	add("godot.set", "set(handle, prop, value) -> Promise<void>", "write", "",
+			"Set an indexed property inside the undoable transaction.", "await godot.set(node, 'visible', false)");
+	add("godot.create", "create(className, ...args) -> Promise<GodotHandle>", "write (untracked for script classes)", "",
+			"Instantiate an indexed class.", "await godot.create('Node3D')");
+	add("godot.getSingleton", "getSingleton(name) -> Promise<GodotHandle>", "read", "",
+			"Get an engine/editor singleton (e.g. EditorInterface).", "await godot.getSingleton('EditorInterface')");
+	add("godot.build", "build({type,name,props,children}, {parent?}) -> Promise<GodotHandle>", "write", "",
+			"Build a node tree in one call with automatic owner assignment. An external action (e.g. scene.new) must run in its own execute call — no writes may surround it.",
+			"await godot.build({type:'Node3D', name:'Root', children:[{type:'MeshInstance3D', name:'M'}]})");
+	add("godot.scene.new", "scene.new(path, {type?, name?}) -> Promise<GodotHandle>", "external action", "filesystem",
+			"Create and open a new .tscn. External: must be the only action in its execute call.",
+			"await godot.scene.new('res://main.tscn', {type:'Node3D'})");
+	add("godot.scene.reload", "scene.reload(path?) -> Promise<GodotHandle>", "external action", "filesystem",
+			"Reopen a saved scene. External: own execute call.", "await godot.scene.reload()");
+	add("godot.scene.tree", "scene.tree({root?, depth?, maxNodes?}) -> Promise<any>", "read", "",
+			"Inspect the scene hierarchy passively.", "await godot.scene.tree({depth: 4})");
+	add("godot.scene.run", "scene.run() -> Promise<{playing, scene?, console}>", "external action", "",
+			 "Play the saved current scene. External: own execute call.", "await godot.scene.run()");
+	add("godot.scene.stop", "scene.stop() -> Promise<{playing}>", "external action", "",
+			"Stop playback. External: own execute call.", "await godot.scene.stop()");
+	add("godot.pluginRead", "pluginRead(name, args?) -> Promise<any>", "read", "per-op",
+			"Invoke a registered read-only plugin operation. Use api.describe('operation:<name>') for schemas.",
+			"await godot.pluginRead('editor.state')");
+	add("godot.pluginCall", "pluginCall(name, args) -> Promise<any>", "write", "per-op",
+			"Invoke a registered undoable plugin operation (capture/restore contract).",
+			"await godot.pluginCall('editor.attach_script', {node, path:'res://a.gd'})");
+	add("godot.pluginAction", "pluginAction(name, args) -> Promise<any>", "external action", "per-op",
+			"Invoke a declared external action. External: own execute call.",
+			"await godot.pluginAction('editor.create_scene', {path:'res://main.tscn'})");
+	add("godot.attachScript", "attachScript(node, 'res://x.gd') -> Promise<any>", "write", "filesystem",
+			"Undoably assign a non-@tool .gd script to a node; the file must already exist (see createScript).",
+			"await godot.attachScript(node, 'res://player.gd')");
+	add("godot.createScript", "createScript(path, source, {overwrite?}) -> Promise<any>", "write", "filesystem",
+			"Undoably write a non-@tool .gd file. Refuses @tool sources and overwriting without overwrite:true. Rollback deletes the file or restores prior bytes.",
+			"await godot.createScript('res://player.gd', 'extends Node3D\\n')");
+	add("godot.batch", "batch(ops) -> Promise<results[]>", "per-element", "",
+			"Apply a list of bridge ops in one dispatch; each element reports its own result.",
+			"await godot.batch([{op:'call', target:h, member:'set_name', args:['X']}])");
+	add("godot.loadResource", "loadResource(path) -> Promise<GodotHandle>", "read/write", "filesystem for uncached",
+			"Load a non-script resource by canonical res:// path.", "await godot.loadResource('res://icon.png')");
+	add("godot.instantiateScene", "instantiateScene(packedScene) -> Promise<GodotHandle>", "write", "",
+			"Instantiate a PackedScene handle.", "await godot.instantiateScene(ps)");
+	add("godot.editor.getEditedScene", "editor.getEditedScene() -> Promise<GodotHandle>", "read", "",
+			"Handle for the current edited scene root.", "await godot.editor.getEditedScene()");
+	add("godot.saveScene", "saveScene() -> Promise<void>", "untracked", "filesystem",
+			"Save the current scene — not undoable, requires untracked mode.", "await godot.saveScene()");
+	add("godot.unlockWrites", "unlockWrites() -> Promise<{was_locked}>", "write", "",
+			"Clear the write lock left by a partial rollback.", "await godot.unlockWrites()");
+	add("godot.requestTier", "requestTier(tier) -> Promise<{granted, tier}>", "read", "",
+			"Request a permission tier; resolves when the user answers (or instantly under allow/auto-grant).",
+			"await godot.requestTier('untracked')");
+	add("godot.unlockedTiers", "unlockedTiers() -> Promise<string[]>", "read", "",
+			"List tiers unlocked this session.", "await godot.unlockedTiers()");
+	add("godot.permissions", "permissions({class?, member?}?) -> Promise<any>", "read", "",
+			"Passive permission introspection: tier/policy summary or per-member explanation. Never grants.",
+			"await godot.permissions({class:'FileAccess'})");
+	add("godot.discoverPlugins", "discoverPlugins() -> Promise<any>", "read", "",
+			"List registered plugin operations.", "await godot.discoverPlugins()");
+	add("godot.values.inspect", "values.inspect(ref) -> Promise<GodotValueInfo>", "read", "",
+			"Inspect an opaque value reference.", "await godot.values.inspect(ref)");
+	add("godot.values.read", "values.read(ref, {offset?, limit?}) -> Promise<GodotValuePage>", "read", "",
+			"Page through an opaque collection value.", "await godot.values.read(ref, {limit: 100})");
+	add("godot.values.release", "values.release(ref) -> Promise<{released}>", "untracked", "",
+			"Release a retained value reference (authorized untracked only).", "await godot.values.release(ref)");
+	add("checkpoint", "checkpoint(name, value) -> void (sync)", "any", "",
+			"Synchronous ordered snapshot surviving failures: 32 entries, 1..128-byte names, 64 KiB total.",
+			"checkpoint('before', godot.serialize?.(x) ?? x)");
+	return out;
+}
+
+JSValue js_api_helpers(JSContext *ctx, JSValueConst, int, JSValueConst *) {
+	return variant_to_js(ctx, helper_metadata());
 }
 
 // ---- JS side of the editor bridge (spec godot-editor-bridge) --------------
@@ -832,6 +967,26 @@ JSValue js_godot_attach_script(JSContext *ctx, JSValueConst, int argc, JSValueCo
 	return submit_op(ctx, "plugin_call", 0, "editor.attach_script", a);
 }
 
+// Facade for the trusted editor.create_script operation registered by the
+// addon. Writes a non-@tool .gd undoably while Script classes stay denied.
+JSValue js_godot_create_script(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
+	if (argc < 2 || !JS_IsString(argv[0]) || !JS_IsString(argv[1])) {
+		return JS_ThrowTypeError(ctx, "godot.createScript('res://x.gd', source, {overwrite?})");
+	}
+	Dictionary args;
+	args["path"] = js_to_variant(ctx, argv[0]);
+	args["source"] = js_to_variant(ctx, argv[1]);
+	if (argc > 2) {
+		Variant opts = js_to_variant(ctx, argv[2]);
+		if (opts.get_type() == Variant::DICTIONARY && (bool)((Dictionary)opts).get("overwrite", false)) {
+			args["overwrite"] = true;
+		}
+	}
+	Array a;
+	a.push_back(args);
+	return submit_op(ctx, "plugin_call", 0, "editor.create_script", a);
+}
+
 JSValue js_godot_load_resource(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
 	if (argc < 1 || !JS_IsString(argv[0])) return JS_ThrowTypeError(ctx, "godot.loadResource(path)");
 	const char *name = JS_ToCString(ctx, argv[0]);
@@ -1215,6 +1370,7 @@ Dictionary JsWorker::execute_one(const ExecRequest &req) {
 		JS_SetPropertyStr(ctx, api_obj, "classes", JS_NewCFunction(ctx, js_api_classes, "classes", 0));
 		JS_SetPropertyStr(ctx, api_obj, "describe", JS_NewCFunction(ctx, guarded<js_api_describe>, "describe", 1));
 		JS_SetPropertyStr(ctx, api_obj, "find", JS_NewCFunction(ctx, guarded<js_api_find>, "find", 1));
+		JS_SetPropertyStr(ctx, api_obj, "helpers", JS_NewCFunction(ctx, guarded<js_api_helpers>, "helpers", 0));
 		JS_SetPropertyStr(ctx, global, "api", api_obj);
 
 		// Tagged-value cookbook: api.example("Transform3D") returns the wire
@@ -1260,6 +1416,7 @@ api.example = function(type) {
 		JS_SetPropertyStr(ctx, godot_obj, "pluginCall", JS_NewCFunction(ctx, guarded<js_godot_plugin_call>, "pluginCall", 2));
 		JS_SetPropertyStr(ctx, godot_obj, "pluginAction", JS_NewCFunction(ctx, guarded<js_godot_plugin_action>, "pluginAction", 2));
 		JS_SetPropertyStr(ctx, godot_obj, "attachScript", JS_NewCFunction(ctx, guarded<js_godot_attach_script>, "attachScript", 2));
+		JS_SetPropertyStr(ctx, godot_obj, "createScript", JS_NewCFunction(ctx, guarded<js_godot_create_script>, "createScript", 3));
 		JS_SetPropertyStr(ctx, godot_obj, "getSingleton", JS_NewCFunction(ctx, guarded<js_godot_singleton>, "getSingleton", 1));
 		JS_SetPropertyStr(ctx, godot_obj, "loadResource", JS_NewCFunction(ctx, guarded<js_godot_load_resource>, "loadResource", 1));
 		JS_SetPropertyStr(ctx, godot_obj, "instantiateScene", JS_NewCFunction(ctx, guarded<js_godot_instantiate_scene>, "instantiateScene", 1));
@@ -1603,8 +1760,25 @@ godot.scene.stop = async function() {
 			out["changes"] = ec.tx->changes;
 		}
 		// External (non-rollbackable) effects stay visible even on failure.
+		// Compact default: per-op-kind counts; verbose keeps the ordered log.
 		if (!ec.tx->effects.is_empty()) {
-			out["effects"] = ec.tx->effects;
+			if (ec.tx->verbose) {
+				out["effects"] = ec.tx->effects;
+			} else {
+				Dictionary counts;
+				int64_t failed = 0;
+				for (int i = 0; i < ec.tx->effects.size(); i++) {
+					Dictionary e = ec.tx->effects[i];
+					String key = e.has("op") ? String(e["op"]) : String(e.get("name", "external"));
+					counts[key] = (int64_t)counts.get(key, (int64_t)0) + 1;
+					if (String(e.get("status", "")) == "failed") failed++;
+				}
+				Dictionary c;
+				c["counts"] = counts;
+				c["total"] = ec.tx->effects.size();
+				if (failed) c["failed"] = failed;
+				out["effects"] = c;
+			}
 		}
 		bool partial = req.mode == "untracked" && !(bool)out.get("ok", false) && !ec.tx->effects.is_empty();
 		if (partial || ec.tx->verbose) out["partial"] = partial;

@@ -4,6 +4,19 @@ Release notes for the 0.3.x series. Earlier releases are available through the
 repository's Git tags. Versions below refer to the addon and MCP server, not
 the MCP protocol or Godot engine version.
 
+## 0.3.3
+
+### Reduced authoring friction
+
+- `allowlist.json` hot-reloads while the editor runs: edits apply within ~100ms via the bridge pump, session tier grants survive, and a malformed mid-save file keeps the prior policy. Fixes policy edits silently requiring a plugin restart.
+- `godot.createScript(path, source, {overwrite?})` writes non-`@tool` `.gd` files through a trusted, undoable `editor.create_script` operation (rollback deletes created files, restores overwritten bytes). `Script`/`GDScript` stay denied.
+- `api.helpers()` returns signatures, modes, tiers, descriptions and examples for every JS helper (`build`, `scene.*`, `pluginRead/Call/Action`, `attachScript`, `createScript`, `values.*`, `batch`, `requestTier`, `permissions`, `checkpoint`) without reading files on disk.
+- Returned `Array`/`Dictionary` values unwrap to native JS arrays/objects inside `execute`; `get_children()` and friends are directly iterable. Packed, typed and reserved-key collections keep their tagged form.
+- `initialize` results include `sessionId` in the body for HTTP clients that ignore headers; the `MCP-Session-Id` header is unchanged. The `execute` tool description now documents that external actions need their own call.
+- `effects` collapses to `{counts, total}` unless `verbose: true` — large `godot.build` results no longer emit ~100 per-op entries.
+- `godot.permissions()` serializes correctly instead of failing with `INVALID_VALUE_ENCODING`.
+- Linux integration and both native builds pass; Windows was cross-built, not run.
+
 ## 0.3.2
 
 ### Compact responses and helper operations
