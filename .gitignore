@@ -17,3 +17,15 @@ core
 
 # Working docs not meant for the repo
 godot-codemode-openspec.pdf
+
+# Python caches
+tools/__pycache__/
+**/__pycache__/
+
+# Local artifacts and generated junk
+dist/
+bench-runs*/
+godot-cm/
+
+# Built addon binaries (distributed via dist/*.zip, not git)
+addons/godot_cm/bin/
