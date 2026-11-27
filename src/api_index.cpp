@@ -17,7 +17,7 @@ using namespace godot;
 
 namespace godot_cm {
 
-ApiCatalog::ApiCatalog(const Dictionary &data) : index(data) { Performance::catalog_created(); }
+ApiCatalog::ApiCatalog() { Performance::catalog_created(); }
 ApiCatalog::~ApiCatalog() { Performance::catalog_destroyed(); }
 
 static Variant parse_json_file(const String &path) {
@@ -53,8 +53,20 @@ static Variant plain_metadata(const Variant &value, int depth = 0) {
 }
 
 static bool reversible_method(const String &owner, const String &method) {
-	if (owner == "Node") return method == "add_child" || method == "remove_child" || method == "set_owner" || method == "reparent" || method == "set_name";
-	return (owner == "Node3D" || owner == "Node2D") && (method == "look_at" || method == "look_at_from_position");
+	if (owner == "Node") {
+		return method == "add_child" || method == "remove_child" || method == "set_owner" || method == "reparent" || method == "set_name" ||
+				method == "add_to_group" || method == "remove_from_group" || method == "move_child" || method == "add_sibling";
+	}
+	if (owner == "Control") {
+		return method == "grab_focus" || method == "release_focus";
+	}
+	if (owner == "Node3D" || owner == "CanvasItem") {
+		if (method == "show" || method == "hide") return true; // inverse: set visible
+	}
+	return (owner == "Node3D" || owner == "Node2D") && (method == "look_at" || method == "look_at_from_position" ||
+			method == "translate" || method == "translate_object_local" || method == "rotate" || method == "rotate_object_local" ||
+			method == "rotate_x" || method == "rotate_y" || method == "rotate_z" || method == "scale_object_local" ||
+			method == "global_rotate" || method == "global_scale" || method == "global_translate" || method == "orthonormalize");
 }
 
 static Dictionary collection_type(const String &name) {
@@ -400,6 +412,11 @@ bool ApiIndex::refresh(bool reconcile) {
 		}
 		deny_members = cfg.get("deny_members", Dictionary());
 		restrict_cfg = cfg.get("restrict", Dictionary());
+		denylist_mode = deny_mode;
+		denied_classes = deny_classes;
+		denied_global = deny_global;
+		denied_members = deny_members;
+		restricted = restrict_cfg;
 		// Tiers: classes that index normally but stay inert until unlocked.
 		Dictionary tiers_cfg = cfg.get("tiers", Dictionary());
 		for (const Variant &t : tiers_cfg.keys()) {
@@ -609,69 +626,18 @@ bool ApiIndex::refresh(bool reconcile) {
 	loaded = true;
 	revision = next_revision;
 	cached_scripts = scripts;
-	{
-		std::lock_guard<std::mutex> lock(catalog_mutex);
-		catalog = std::make_shared<ApiCatalog>(index);
-		Performance::add(PerfMetric::CATALOG_PUBLICATIONS);
-	}
+	refresh_catalog();
+	Performance::add(PerfMetric::CATALOG_PUBLICATIONS);
 	UtilityFunctions::print("[godot-cm] api index loaded: ", index.size(), " classes");
 	return true;
 }
 
-Array ApiCatalog::classes() const {
-	Array out;
-	Array names = index.keys();
-	for (int i = 0; i < names.size(); i++) {
-		Dictionary c;
-		String n = names[i];
-		c["name"] = n;
-		c["inherits"] = ((Dictionary)index[n]).get("inherits", "");
-		Dictionary entry = index[n];
-		for (const char *key : {"kind", "source", "path", "metadata_status", "tier", "singletons", "construct_mode"}) {
-			if (entry.has(key)) c[key] = entry[key];
-		}
-		out.push_back(c);
-	}
-	return out;
+Variant ApiIndex::describe(const String &name) const {
+	return index.has(name) ? index[name] : Variant();
+	UtilityFunctions::print("[godot-cm] api index loaded: ", index.size(), " classes");
+	return true;
 }
 
-Variant ApiCatalog::describe(const String &name) const {
-	if (!index.has(name)) {
-		return Variant();
-	}
-	return index[name];
-}
-
-Array ApiCatalog::find(const String &query) const {
-	Array out;
-	String q = query.to_lower();
-	Array names = index.keys();
-	for (int i = 0; i < names.size(); i++) {
-		String n = names[i];
-		if (n.to_lower().contains(q)) {
-			out.push_back(n);
-			continue;
-		}
-		// match members too
-		Dictionary e = index[n];
-		bool hit = String(e.get("path", "")).to_lower().contains(q) || String(e.get("source", "")).to_lower().contains(q);
-		for (const char *field : {"methods", "properties"}) {
-			Array members = e.get(field, Array());
-			for (const Variant &item : members) {
-				if (String(((Dictionary)item).get("name", "")).to_lower().contains(q)) { hit = true; break; }
-			}
-		}
-		Array keys = ((Dictionary)e.get("constants", Dictionary())).keys();
-		keys.append_array(e.get("singletons", Array()));
-		for (const Variant &key : keys) {
-			if (String(key).to_lower().contains(q)) { hit = true; break; }
-		}
-		if (hit) {
-			out.push_back(n);
-		}
-	}
-	return out;
-}
 
 static String ts_type(const Variant &t) {
 	String s = String(t);
@@ -817,6 +783,7 @@ bool ApiIndex::tier_unlocked(const String &tier) const {
 void ApiIndex::unlock_tier(const String &tier) {
 	if (tier_classes.has(tier)) {
 		unlocked[tier] = true;
+		refresh_catalog();
 	}
 }
 
@@ -824,10 +791,12 @@ void ApiIndex::unlock_all_tiers() {
 	for (const Variant &t : tier_classes.keys()) {
 		unlocked[t] = true;
 	}
+	refresh_catalog();
 }
 
 void ApiIndex::lock_tier(const String &tier) {
 	unlocked.erase(tier);
+	refresh_catalog();
 }
 
 Array ApiIndex::tier_class_names(const String &tier) const {
@@ -851,6 +820,7 @@ void ApiIndex::set_tier_policy(const String &tier, const String &policy) {
 		return;
 	}
 	tier_policy[tier] = policy;
+	refresh_catalog();
 }
 
 Array ApiIndex::tiers() const {
@@ -902,6 +872,336 @@ bool ApiIndex::member_declared(const String &class_name, const String &member) c
 
 bool ApiIndex::member_allowed(const String &class_name, const String &member) const {
 	return class_allowed(class_name) && (!member_info(class_name, member).is_empty() || !member_info(class_name, member, true).is_empty());
+}
+
+static Variant catalog_data(const Variant &value, int depth = 0) {
+	if (depth > 32) return Variant();
+	switch (value.get_type()) {
+		case Variant::NIL:
+		case Variant::BOOL:
+		case Variant::INT:
+		case Variant::FLOAT:
+		case Variant::STRING:
+			return value;
+		case Variant::STRING_NAME:
+			return String(value);
+		case Variant::ARRAY: {
+			Array source = value;
+			Array out;
+			for (int i = 0; i < source.size(); i++) out.push_back(catalog_data(source[i], depth + 1));
+			return out;
+		}
+		case Variant::DICTIONARY: {
+			Dictionary source = value;
+			Dictionary out;
+			for (const Variant &key : source.keys()) {
+				if (key.get_type() == Variant::STRING || key.get_type() == Variant::STRING_NAME) {
+					out[String(key)] = catalog_data(source[key], depth + 1);
+				}
+			}
+			return out;
+		}
+		default:
+			return Variant();
+	}
+}
+
+void ApiIndex::publish_catalog(const Array &scripts, const Dictionary &operations) {
+	script_metadata = catalog_data(scripts);
+	operation_metadata = catalog_data(operations);
+	refresh_catalog();
+}
+
+static Dictionary metadata_type(const Dictionary &info, bool is_return = false) {
+	Dictionary out;
+	out["name"] = info.get("name", "");
+	Variant type = info.get("type", "Variant");
+	String class_name = info.get("class_name", "");
+	String nil_type = is_return && !((int)info.get("usage", 0) & PROPERTY_USAGE_NIL_IS_VARIANT) ? "void" : "Variant";
+	out["type"] = !class_name.is_empty() ? class_name : type.get_type() == Variant::INT
+			? ((int)type == Variant::NIL ? nil_type : Variant::get_type_name((Variant::Type)(int)type))
+			: String(type);
+	return out;
+}
+
+// Rebuild the published catalog snapshot from `index` + registered script /
+// operation metadata. Called by refresh() after index rebuild and by
+// publish_catalog when plugin code registers new operations.
+void ApiIndex::refresh_catalog() {
+	auto next = std::make_shared<ApiCatalog>();
+	auto add = [&](const String &id, const String &name, Dictionary entry) {
+		if (next->entries.has(id)) return;
+		entry["id"] = id;
+		entry["name"] = name;
+		next->entries[id] = entry;
+		Array ids = next->aliases.get(name, Array());
+		ids.push_back(id);
+		next->aliases[name] = ids;
+	};
+	auto permissions = [&](const String &tier) {
+		Dictionary out;
+		out["tier"] = tier;
+		out["locked"] = !tier.is_empty() && !tier_unlocked(tier);
+		out["policy"] = tier.is_empty() ? String("allow") : policy_of(tier);
+		return out;
+	};
+	for (const Variant &key : index.keys()) {
+		String name = key;
+		Dictionary entry = ((Dictionary)index[key]).duplicate();
+		String kind = entry.get("kind", "native_class");
+		entry["permissions"] = permissions(tiered.get(name, ""));
+		Dictionary execution;
+		execution["direct_access"] = class_allowed(name);
+		execution["undo"] = "operation_dependent";
+		entry["execution"] = execution;
+		if (kind == "script_class") {
+			add("script:" + String(entry.get("path", name)), name, entry);
+		} else {
+			add("native:" + name, name, entry);
+		}
+	}
+	for (int i = 0; i < script_metadata.size(); i++) {
+		if (script_metadata[i].get_type() != Variant::DICTIONARY) continue;
+		Dictionary info = script_metadata[i];
+		String name = info.get("class", info.get("name", ""));
+		String path = info.get("path", "");
+		if (name.is_empty()) continue;
+		Dictionary entry;
+		entry["kind"] = "script_class";
+		entry["source"] = info.get("language", "GDScript");
+		entry["path"] = path;
+		entry["inherits"] = info.get("base", info.get("inherits", ""));
+		entry["metadata_status"] = info.has("methods") ? "cached_members" : "class_only";
+		Array methods;
+		Array raw_methods = info.get("methods", Array());
+		for (int m = 0; m < raw_methods.size(); m++) {
+			if (raw_methods[m].get_type() != Variant::DICTIONARY) continue;
+			Dictionary raw = raw_methods[m];
+			Dictionary method;
+			method["name"] = raw.get("name", "");
+			Array args;
+			Array raw_args = raw.get("args", raw.get("arguments", Array()));
+			Array defaults = raw.get("default_args", raw.get("default_arguments", Array()));
+			for (int a = 0; a < raw_args.size(); a++) {
+				if (raw_args[a].get_type() != Variant::DICTIONARY) continue;
+				Dictionary arg = metadata_type(raw_args[a]);
+				int default_index = a - (raw_args.size() - defaults.size());
+				if (default_index >= 0 && default_index < defaults.size()) {
+					arg["default"] = defaults[default_index];
+					arg["optional"] = true;
+				}
+				args.push_back(arg);
+			}
+			method["arguments"] = args;
+			Variant ret = raw.get("return", raw.get("return_value", Dictionary()));
+			method["return"] = ret.get_type() == Variant::DICTIONARY ? Variant(metadata_type(ret, true)) : ret;
+			methods.push_back(method);
+		}
+		Array properties;
+		Array raw_props = info.get("properties", Array());
+		for (int p = 0; p < raw_props.size(); p++) {
+			if (raw_props[p].get_type() == Variant::DICTIONARY) properties.push_back(metadata_type(raw_props[p]));
+		}
+		entry["methods"] = methods;
+		entry["properties"] = properties;
+		Dictionary execution;
+		execution["direct_access"] = false;
+		execution["reason"] = "register_plugin_operation";
+		entry["execution"] = execution;
+		add("script:" + (path.is_empty() ? name : path), name, entry);
+	}
+	for (const Variant &key : operation_metadata.keys()) {
+		String name = key;
+		Dictionary info = operation_metadata[key];
+		Dictionary entry;
+		bool read_only = info.get("read_only", false);
+		bool external = String(info.get("effect", "transaction")) == "external";
+		String tier = info.get("tier", "");
+		entry["kind"] = "operation";
+		entry["source"] = "registered";
+		entry["inherits"] = "";
+		entry["description"] = info.get("description", "");
+		entry["arguments"] = info.get("arguments", Array());
+		entry["signature_status"] = info.has("arguments") || info.has("input_schema") ? "declared" : "opaque_dictionary";
+		entry["return"] = info.get("return", "Variant");
+		Dictionary schema;
+		schema["type"] = "object";
+		entry["input_schema"] = info.get("input_schema", schema);
+		entry["permissions"] = permissions(tier);
+		Dictionary execution;
+		execution["available"] = info.get("available", false);
+		execution["invocable"] = (bool)info.get("available", false) && (tier.is_empty() || tier_unlocked(tier));
+		execution["bridge"] = external ? "godot.pluginAction" : read_only ? "godot.pluginRead" : "godot.pluginCall";
+		execution["name"] = name;
+		execution["mode"] = read_only ? "read" : "write";
+		execution["effect"] = external ? "external" : read_only ? "read" : "transaction";
+		execution["undo"] = external ? "not_rollbackable" : read_only ? "not_applicable" : "capture_restore_contract";
+		entry["execution"] = execution;
+		add("operation:" + name, name, entry);
+	}
+	std::lock_guard<std::mutex> lock(catalog_mutex);
+	catalog = std::move(next);
+}
+
+Array ApiCatalog::classes() const {
+	Array out;
+	for (const Variant &id : entries.keys()) {
+		Dictionary entry = entries[id];
+		Dictionary summary;
+		for (const char *key : {"id", "name", "inherits", "kind", "source", "path", "metadata_status", "execution", "permissions"}) {
+			if (entry.has(key)) summary[key] = entry[key];
+		}
+		out.push_back(summary);
+	}
+	return out;
+}
+
+Variant ApiCatalog::describe(const String &name) const {
+	if (entries.has(name)) return entries[name];
+	Array ids = aliases.get(name, Array());
+	if (ids.is_empty()) return Variant();
+	if (ids.size() == 1) return entries[ids[0]];
+	Dictionary ambiguous;
+	ambiguous["ambiguous"] = true;
+	ambiguous["matches"] = ids;
+	return ambiguous;
+}
+
+Array ApiCatalog::find(const String &query) const {
+	Array out;
+	String q = query.to_lower();
+	for (const Variant &id : entries.keys()) {
+		Dictionary entry = entries[id];
+		String name = entry["name"];
+		bool hit = name.to_lower().contains(q) || String(id).to_lower().contains(q) ||
+				String(entry.get("description", "")).to_lower().contains(q);
+		for (const char *key : {"methods", "properties"}) {
+			Array members = entry.get(key, Array());
+			for (int m = 0; m < members.size() && !hit; m++) {
+				hit = String(((Dictionary)members[m]).get("name", "")).to_lower().contains(q);
+			}
+		}
+		if (hit) {
+			Array ids = aliases[name];
+			out.push_back(ids.size() == 1 ? Variant(name) : id);
+		}
+	}
+	return out;
+}
+
+Dictionary ApiIndex::permissions_summary() const {
+	Dictionary out;
+	Array ts;
+	for (const Variant &t : tier_classes.keys()) {
+		String tier = t;
+		Dictionary td;
+		td["name"] = tier;
+		td["policy"] = policy_of(tier);
+		td["unlocked"] = unlocked.has(tier);
+		Array classes = tier_classes[tier];
+		td["class_count"] = classes.size();
+		Array examples;
+		for (int i = 0; i < classes.size() && i < 8; i++) {
+			examples.push_back(classes[i]);
+		}
+		td["class_examples"] = examples;
+		ts.push_back(td);
+	}
+	out["tiers"] = ts;
+	Array denied;
+	for (const Variant &c : denied_classes.keys()) {
+		denied.push_back(c);
+	}
+	denied.sort();
+	out["denied_classes"] = denied;
+	Array global;
+	for (const Variant &m : denied_global.keys()) {
+		global.push_back(m);
+	}
+	global.sort();
+	out["denied_members_global"] = global;
+	out["note"] = "Denied classes/members are never unlockable; tiered classes unlock via godot.requestTier(tier). Query a member with godot.permissions({class, member}).";
+	return out;
+}
+
+// Explain why class/member is (not) callable. Passive: reads deny metadata
+// captured at index load; grants nothing.
+Dictionary ApiIndex::permission_info(const String &class_name, const String &member) const {
+	Dictionary out;
+	String cls = class_name;
+	ClassDBSingleton *cdb = ClassDBSingleton::get_singleton();
+
+	// Class-level denial wins (deny_classes applies to descendants too).
+	bool class_denied = false;
+	if (denylist_mode) {
+		for (String c = cls; !c.is_empty();) {
+			if (denied_classes.has(c)) {
+				class_denied = true;
+				break;
+			}
+			c = cdb ? cdb->get_parent_class(c) : "";
+		}
+	}
+	out["class"] = cls;
+	out["class_allowed"] = !class_denied && index.has(cls);
+	if (class_denied) {
+		out["reason"] = "class_denied";
+	}
+	if (!class_denied && tiered.has(cls)) {
+		String t = tiered[cls];
+		Dictionary td;
+		td["tier"] = t;
+		td["locked"] = !unlocked.has(t);
+		td["policy"] = policy_of(t);
+		out["tier"] = td;
+		if ((bool)td["locked"]) {
+			out["reason"] = "tier_locked";
+			out["unlock"] = "godot.requestTier(\"" + t + "\")";
+		}
+	}
+
+	if (member.is_empty()) {
+		out["allowed"] = (bool)out["class_allowed"] && !out.has("tier");
+		return out;
+	}
+	out["member"] = member;
+	if (class_denied) {
+		out["allowed"] = false;
+		return out;
+	}
+	if (denied_global.has(member)) {
+		out["allowed"] = false;
+		out["reason"] = "meta_method_denied";
+		return out;
+	}
+	// Inherited member denials apply from the denying class down.
+	for (String c = cls; !c.is_empty();) {
+		if (denied_members.has(c) &&
+				((Array)denied_members[c]).has(member)) {
+			out["allowed"] = false;
+			out["reason"] = "member_denied";
+			out["denied_on"] = c;
+			return out;
+		}
+		c = cdb ? cdb->get_parent_class(c) : "";
+	}
+	if (restricted.has(cls)) {
+		Dictionary r = restricted[cls];
+		Array methods = r.get("methods", Array());
+		Array props = r.get("properties", Array());
+		if (!methods.has(member) && !props.has(member)) {
+			out["allowed"] = false;
+			out["reason"] = "restricted_class";
+			out["note"] = "this class is allow-only: only listed members are exposed";
+			return out;
+		}
+	}
+	bool allowed = member_allowed(cls, member);
+	out["allowed"] = allowed;
+	if (!allowed && !out.has("reason")) {
+		out["reason"] = out.has("tier") ? "tier_locked" : "member_not_indexed";
+	}
+	return out;
 }
 
 } // namespace godot_cm

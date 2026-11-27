@@ -52,11 +52,15 @@ struct BridgeResult {
 // (spec editor-transactions): change log, inverse journal for undo/rollback,
 // and the editor undo version seen at tx start for external-change detection.
 struct TxState {
-	godot::Array changes;        // human-readable change log (reported)
+	godot::Array changes;        // human-readable change log (reported when verbose)
+	godot::Dictionary change_counts; // "Class.op" -> count, compact default report
+	bool verbose = false;
 	godot::Array journal;        // entries {"f": fwd-op, "i": inverse-op}
 	int64_t undo_version = -1;   // EditorUndoRedoManager version at first write
 	std::atomic<bool> conflict{false};
 	bool untracked = false;
+	bool wrote = false;
+	bool external = false;
 	godot::Array effects;
 };
 
@@ -112,6 +116,10 @@ public:
 	Bridge();
 	uint64_t handle_id(const godot::String &name) const;
 	ApiIndex *index = nullptr;
+	godot::Dictionary plugin_methods;
+	godot::Callable plugin_discovery;
+	godot::Array script_metadata;
+	void refresh_catalog();
 	// Fired (main thread) when an op needs a tier unlock decision from the user.
 	std::function<void(const godot::String &tier)> tier_request_cb;
 

@@ -291,6 +291,12 @@ The execution envelope before MCP wrapping is bounded to 256 KiB. `truncated`,
 `result_omitted`, `effects_omitted`, `changes_omitted`, `diagnostics_omitted` and
 metadata omission counts identify incomplete data. The primary error and
 completed checkpoints are retained; an effect prefix is not a complete history.
+Higher-level helpers: `godot.build({type,name,props,children},{parent})`,
+`godot.scene.new/reload/tree/run/stop`, `godot.attachScript(node,'res://x.gd')`,
+`godot.permissions({class,member})`, `api.example(type)`.
+Responses are compact by default: empty fields are omitted and writes are
+summarized as `changes: {counts: {"Class.op": n}, total, status}` — pass
+`verbose: true` on the tool call for the ordered per-op log.
 
 `godot.batch` applies a list of ops in **one** main-thread dispatch and
 resolves with ordered per-element results — the fast path for op-dense

@@ -22,6 +22,7 @@ struct ExecRequest {
 	std::string code;
 	std::string mode = "read"; // "read" | "write"
 	bool search_only = false;  // search tool: api index only, no editor bindings
+	bool verbose = false;      // report per-op change detail instead of a summary
 	int64_t timeout_ms = 0;    // <=0: mode default (5s read / 60s write)
 	std::shared_ptr<std::atomic<bool>> cancel;  // set by notifications/cancelled
 	std::shared_ptr<TxState> tx;                // per-request transaction state

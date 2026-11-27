@@ -10,6 +10,8 @@
 #include <godot_cpp/classes/editor_undo_redo_manager.hpp>
 #include <godot_cpp/classes/engine.hpp>
 #include <godot_cpp/classes/node.hpp>
+#include <godot_cpp/classes/packed_scene.hpp>
+#include <godot_cpp/classes/resource_loader.hpp>
 #include <godot_cpp/classes/ref_counted.hpp>
 #include <godot_cpp/classes/os.hpp>
 #include <godot_cpp/classes/scene_tree.hpp>
@@ -142,6 +144,19 @@ static BridgeResult invoke_checked(Object *target, const StringName &method, con
 	return result;
 }
 
+static BridgeResult begin_external(const std::shared_ptr<TxState> &tx, const String &name) {
+	if (!tx || tx->wrote || tx->external) {
+		return op_error("MIXED_EFFECTS", "external actions require a separate execute call with no other writes");
+	}
+	tx->external = true;
+	Dictionary effect;
+	effect["name"] = name;
+	effect["rollbackable"] = false;
+	effect["status"] = "dispatched";
+	tx->effects.push_back(effect);
+	return op_value(Variant());
+}
+
 // Convert a Variant result into wire form: objects become handle dicts,
 // arrays and dictionaries are converted recursively.
 Variant Bridge::to_wire(const Variant &v) {
@@ -219,13 +234,16 @@ ValueCodec Bridge::make_codec() {
 		return result;
 	};
 	codec.object_matches = [this](Object *object, const String &cls) {
-		if (object->is_class(cls)) return true;
-		String current = index ? index->script_class(object) : String();
-		for (int i = 0; !current.is_empty() && i < 64; i++) {
-			if (current == cls) return true;
-			Variant entry = index->describe(current);
-			if (entry.get_type() != Variant::DICTIONARY) break;
-			current = ((Dictionary)entry).get("inherits", "");
+		// class_name may carry a hint list ("BaseMaterial3D,ShaderMaterial").
+		for (const String &want : cls.split(",", false)) {
+			if (object->is_class(want)) return true;
+			String current = index ? index->script_class(object) : String();
+			for (int i = 0; !current.is_empty() && i < 64; i++) {
+				if (current == want) return true;
+				Variant entry = index->describe(current);
+				if (entry.get_type() != Variant::DICTIONARY) break;
+				current = ((Dictionary)entry).get("inherits", "");
+			}
 		}
 		return false;
 	};
@@ -494,6 +512,72 @@ static String member_denied_msg(ApiIndex *index, Object *obj, const String &kind
 	return msg;
 }
 
+// Passive scene inspection: names, native classes, script paths — no script
+// loading or instantiation. depth/maxNodes bound the walk; truncation is
+// reported instead of cutting mid-subtree.
+static void scene_tree_walk(Node *n, int depth, int max_depth, int &budget,
+		Dictionary &out, bool &truncated) {
+	if (budget <= 0) {
+		truncated = true;
+		return;
+	}
+	budget--;
+	out["name"] = String(n->get_name());
+	out["class"] = n->get_class();
+	Variant sv = n->get_script();
+	if (sv.get_type() == Variant::OBJECT) {
+		Object *s = sv;
+		if (s != nullptr) {
+			String p = String(s->get("resource_path"));
+			if (!p.is_empty()) {
+				out["script"] = p;
+			}
+		}
+	}
+	Array kids;
+	if (depth < max_depth) {
+		for (int i = 0; i < n->get_child_count(); i++) {
+			Dictionary cd;
+			scene_tree_walk(n->get_child(i), depth + 1, max_depth, budget, cd, truncated);
+			kids.push_back(cd);
+		}
+	} else if (n->get_child_count() > 0) {
+		truncated = true;
+	}
+	if (!kids.is_empty()) {
+		out["children"] = kids;
+	}
+}
+
+// Compact change reporting: default counts grouped as "Class.op"; verbose
+// keeps the ordered per-op detail in tx->changes.
+static void record_change(const std::unordered_map<uint64_t, ObjectID> &handles,
+		TxState *tx, const BridgeOp &op) {
+	if (!tx) {
+		return;
+	}
+	String cls = op.class_name.c_str();
+	if (cls.is_empty()) {
+		Object *t = resolve_handle(handles, op.target);
+		if (t) {
+			cls = t->get_class();
+		}
+	}
+	if (cls.is_empty()) {
+		cls = "?";
+	}
+	if (tx->verbose) {
+		Dictionary ch;
+		ch["op"] = op.kind.c_str();
+		ch["member"] = op.member.c_str();
+		ch["class"] = cls;
+		tx->changes.push_back(ch);
+		return;
+	}
+	String key = cls + "." + String(op.kind.c_str());
+	tx->change_counts[key] = (int64_t)tx->change_counts.get(key, (int64_t)0) + 1;
+}
+
 // --- Transaction journal ---------------------------------------------------
 // Journal entries: {"f": forward-op, "i": inverse-op}. Simple ops are dicts:
 //   {k:"set",  oid, prop, val}
@@ -529,13 +613,14 @@ static bool apply_simple(const Dictionary &d) {
 		obj->set(StringName(String(d["prop"])), d["val"]);
 		return true;
 	}
-	if (k == "call" || k == "callv") {
+	if (k == "call" || k == "callv" || k == "plugin_call" || k == "plugin_restore") {
 		Array args = d.has("aa") ? (Array)d["aa"] : Array();
 		if (!d.has("aa")) {
 			args.push_back(d["a0"]);
 		}
-		obj->callv(StringName(String(d["m"])), args);
-		return true;
+		if (!obj->has_method(StringName(String(d["m"])))) return false;
+		Variant result = obj->callv(StringName(String(d["m"])), args);
+		return k != "plugin_restore" || (result.get_type() == Variant::BOOL && (bool)result);
 	}
 	if (k == "free") {
 		// Created-but-unadopted node: safe to delete; adopted ones were
@@ -581,7 +666,7 @@ static void bind_entry(EditorUndoRedoManager *ur, const Dictionary &e, int &boun
 				ur->add_undo_method(obj, "set", StringName(String(d["prop"])), d["val"]);
 			}
 			bound++;
-		} else if (k == "call" || k == "callv") {
+		} else if (k == "call" || k == "callv" || k == "plugin_call" || k == "plugin_restore") {
 			StringName m = StringName(String(d["m"]));
 			Array aa = d.has("aa") ? (Array)d["aa"] : Array();
 			if (!d.has("aa")) {
@@ -761,6 +846,18 @@ BridgeResult Bridge::dispatch_op(const BridgeOp &op, const std::shared_ptr<TxSta
 		return op_value(index ? index->unlocked_tiers() : Array());
 	}
 
+	if (kind == "permissions") {
+		if (!index) {
+			return op_error("NO_INDEX", "api index not loaded");
+		}
+		Dictionary q = op.args.size() > 0 && op.args[0].get_type() == Variant::DICTIONARY
+				? (Dictionary)op.args[0] : Dictionary();
+		String cls = q.get("class", "");
+		String member = q.get("member", "");
+		return cls.is_empty() ? op_value(index->permissions_summary())
+				: op_value(index->permission_info(cls, member));
+	}
+
 	if (kind == "save_scene") {
 		if (!op.untracked) return op_error("UNTRACKED_REQUIRED", "saving is not undoable; use mode untracked");
 		if (!index || !index->tier_unlocked("filesystem")) return op_error("PERMISSION", "saving requires filesystem permission");
@@ -775,6 +872,8 @@ BridgeResult Bridge::dispatch_op(const BridgeOp &op, const std::shared_ptr<TxSta
 	// External-change detection: any write inside a tx re-checks the editor
 	// undo version captured at the tx's first write (spec: External change).
 	if (op.write) {
+		if (tx && tx->external) return op_error("MIXED_EFFECTS", "no writes may follow an external action in the same execute call");
+		if (tx && kind != "plugin_action" && kind != "batch") tx->wrote = true;
 		if (write_locked.load()) {
 			return op_error("TX_LOCKED", "writes locked: prior rollback left partial state");
 		}
@@ -799,6 +898,12 @@ BridgeResult Bridge::dispatch_op(const BridgeOp &op, const std::shared_ptr<TxSta
 	// Batch (spec godot-editor-bridge): elements run inline in this same
 	// dispatch; each gets its own result so one failure doesn't fail siblings.
 	if (kind == "batch") {
+		for (int i = 0; i < op.elements.size(); i++) {
+			String element_kind = ((Dictionary)op.elements[i]).get("kind", "");
+			if (element_kind == "plugin_action" || element_kind == "save_scene") {
+				return op_error("MIXED_EFFECTS", "external actions cannot be batched");
+			}
+		}
 		Array results;
 		Array warns;
 		for (int i = 0; i < op.elements.size(); i++) {
@@ -826,10 +931,7 @@ BridgeResult Bridge::dispatch_op(const BridgeOp &op, const std::shared_ptr<TxSta
 					warns.push_back(wd);
 				}
 				if (r.ok && r.write && tx && !tx->untracked) {
-					Dictionary ch;
-					ch["op"] = ek;
-					ch["member"] = sub.member.c_str();
-					tx->changes.push_back(ch);
+					record_change(handles, tx.get(), sub);
 				}
 			}
 			Dictionary rd;
@@ -894,6 +996,104 @@ BridgeResult Bridge::dispatch_op(const BridgeOp &op, const std::shared_ptr<TxSta
 		BridgeResult result = project_class ? invoke_checked(script.ptr(), method, args) : invoke_checked(ClassDBSingleton::get_singleton(), "class_call_static", args);
 		if (result.ok) result.value = to_wire(result.value);
 		return result;
+	}
+
+	if (kind == "discover_plugins") {
+		Dictionary out;
+		out["scripts"] = script_metadata;
+		Array methods;
+		for (const Variant &name : plugin_methods.keys()) {
+			Dictionary entry = ((Dictionary)plugin_methods[name]).duplicate(true);
+			if (!ObjectDB::get_instance(ObjectID((uint64_t)entry["provider"]))) continue;
+			entry.erase("provider");
+			entry["name"] = name;
+			methods.push_back(entry);
+		}
+		out["methods"] = methods;
+		return op_value(out);
+	}
+
+	if (kind == "plugin_read" || kind == "plugin_call" || kind == "plugin_action") {
+		String name = op.member.c_str();
+		if (!plugin_methods.has(name)) return op_error("NOT_FOUND", "plugin method not registered: " + name);
+		Dictionary entry = plugin_methods[name];
+		bool read_only = entry.get("read_only", false);
+		bool external = String(entry.get("effect", "transaction")) == "external";
+		if ((external && kind != "plugin_action") || (!external && kind == "plugin_action")) {
+			return op_error("EFFECT_MISMATCH", "use pluginAction only for declared external actions");
+		}
+		if (!read_only && !external && kind != "plugin_call") return op_error("PERMISSION", "plugin method requires write mode");
+		String tier = entry.get("tier", "");
+		if (!tier.is_empty() && (!index || !index->tier_unlocked(tier))) {
+			return op_error("PERMISSION", "plugin method requires tier: " + tier);
+		}
+		Object *provider = ObjectDB::get_instance(ObjectID((uint64_t)entry["provider"]));
+		String method = entry.get("method", "");
+		if (!provider || !provider->has_method(method)) return op_error("INVALID_HANDLE", "plugin provider unavailable");
+		Array args;
+		Variant input = op.args.is_empty() ? Variant(Dictionary()) : op.args[0];
+		if (input.get_type() != Variant::DICTIONARY) return op_error("BAD_ARGS", "plugin arguments must be an object");
+		args.push_back(input);
+		if (external) {
+			BridgeResult gate = begin_external(tx, name);
+			if (!gate.ok) return gate;
+		}
+		if (!read_only && !external) {
+			if (!tx) return op_error("NO_UNDO", "plugin mutation requires a transaction");
+			String capture = entry.get("capture", "");
+			String restore = entry.get("restore", "");
+			if (!provider->has_method(capture) || !provider->has_method(restore)) {
+				return op_error("NO_UNDO", "plugin capture/restore unavailable");
+			}
+			Variant snapshot = provider->callv(capture, args);
+			if (snapshot.get_type() != Variant::DICTIONARY || !(bool)((Dictionary)snapshot).get("ok", false)) {
+				String message = snapshot.get_type() == Variant::DICTIONARY ? String(((Dictionary)snapshot).get("message", "plugin capture failed")) : "plugin capture failed";
+				return op_error("NO_UNDO", message);
+			}
+			Dictionary forward = simple_op("plugin_call", provider->get_instance_id());
+			forward["m"] = method;
+			forward["aa"] = args;
+			Dictionary inverse = simple_op("plugin_restore", provider->get_instance_id());
+			inverse["m"] = restore;
+			Array undo_args;
+			undo_args.push_back(((Dictionary)snapshot).get("state", Variant()));
+			inverse["aa"] = undo_args;
+			journal(tx.get(), forward, inverse);
+		}
+		Variant result = provider->callv(method, args);
+		bool ok = result.get_type() == Variant::DICTIONARY && (bool)((Dictionary)result).get("ok", false);
+		if (external) {
+			Dictionary effect = tx->effects[0];
+			effect["status"] = ok ? "completed" : "failed";
+		}
+		if (!ok) {
+			String message = result.get_type() == Variant::DICTIONARY
+					? String(((Dictionary)result).get("message", "plugin operation failed: " + name)) : "plugin operation failed: " + name;
+			return op_error("PLUGIN_FAILED", message);
+		}
+		return op_value(to_wire(((Dictionary)result).get("result", Variant())));
+	}
+
+	if (kind == "load_resource") {
+		if (!index || !index->member_allowed("ResourceLoader", "load")) {
+			return op_error("PERMISSION", "ResourceLoader.load not allowed; check filesystem tier");
+		}
+		String path = op.member.c_str();
+		PackedStringArray parts = path.substr(6).split("/");
+		if (!path.begins_with("res://") || path.contains("\\") || path.simplify_path() != path ||
+				parts.has("..") || parts.has(".") || parts.has("")) {
+			return op_error("BAD_PATH", "resource path must be a canonical res:// path");
+		}
+		String extension = path.get_extension().to_lower();
+		ResourceLoader *loader = ResourceLoader::get_singleton();
+		if (!loader->get_recognized_extensions_for_type("").has(extension) ||
+				loader->get_recognized_extensions_for_type("Script").has(extension)) {
+			return op_error("PERMISSION", "unsupported or script resource extension");
+		}
+		Ref<Resource> resource = loader->load(path);
+		if (resource.is_null()) return op_error("LOAD_FAILED", "could not load: " + path);
+		if (!index->class_allowed(resource->get_class())) return op_error("PERMISSION", "resource class not allowed");
+		return op_value(to_wire(resource));
 	}
 
 	if (kind == "create") {
@@ -962,10 +1162,49 @@ BridgeResult Bridge::dispatch_op(const BridgeOp &op, const std::shared_ptr<TxSta
 		return op_value(wire);
 	}
 
+	if (kind == "scene_tree") {
+		Node *root_node = nullptr;
+		if (op.target) {
+			root_node = Object::cast_to<Node>(resolve_handle(handles, op.target));
+		} else {
+			EditorInterface *ei = EditorInterface::get_singleton();
+			if (ei) {
+				root_node = ei->get_edited_scene_root();
+			}
+		}
+		if (!root_node) {
+			return op_error("NOT_FOUND", "no scene root (open a scene or pass a node handle)");
+		}
+		Dictionary opts = op.args.size() > 0 && op.args[0].get_type() == Variant::DICTIONARY
+				? (Dictionary)op.args[0] : Dictionary();
+		int max_depth = (int)(int64_t)opts.get("depth", 32);
+		int budget = (int)(int64_t)opts.get("maxNodes", 2000);
+		Dictionary tree;
+		bool truncated = false;
+		scene_tree_walk(root_node, 0, max_depth, budget, tree, truncated);
+		if (truncated) {
+			tree["truncated"] = true;
+		}
+		return op_value(tree);
+	}
+
 	// Handle-targeted ops
 	Object *target = resolve_handle(handles, op.target);
 	if (target == nullptr) {
 		return op_error("INVALID_HANDLE", "handle expired or unknown");
+	}
+
+	if (kind == "instantiate_scene") {
+		if (!index || !index->member_allowed("PackedScene", "instantiate")) {
+			return op_error("PERMISSION", "PackedScene.instantiate not allowed");
+		}
+		PackedScene *scene = Object::cast_to<PackedScene>(target);
+		if (!scene) return op_error("BAD_TARGET", "instantiateScene requires a PackedScene handle");
+		Node *node = scene->instantiate();
+		if (!node) return op_error("CREATE_FAILED", "scene instantiation failed");
+		retained_nodes.push_back(node);
+		journal(tx.get(), simple_op("ref", node->get_instance_id()), simple_op("free", node->get_instance_id()));
+		return op_value(to_wire(node));
 	}
 
 	// Signal wiring (spec godot-editor-bridge): connect/disconnect need a
@@ -1062,6 +1301,23 @@ BridgeResult Bridge::dispatch_op(const BridgeOp &op, const std::shared_ptr<TxSta
 		// Journal-or-reject (spec editor-transactions): a mutating call we
 		// cannot invert is refused at dispatch instead of applied unjournaled.
 		if (op.write && !op.untracked && !index->method_reversible(target->get_class(), method)) {
+			// set_x(v) with an authorized property x is the same mutation
+			// as `set` — route it through the journaled set path so both
+			// spellings behave identically.
+			if (method.begins_with("set_") && op.args.size() >= 1) {
+				String prop = method.substr(4);
+				if (member_authorized(index, target, prop, true)) {
+					Variant arg = op.args[0];
+					uint64_t poid = (uint64_t)target->get_instance_id();
+					Variant prior = target->get(prop);
+					target->set(prop, arg);
+					Dictionary f = simple_op("set", poid), i = simple_op("set", poid);
+					f["prop"] = prop; f["val"] = arg;
+					i["prop"] = prop; i["val"] = prior;
+					journal(tx.get(), f, i);
+					return op_value(Variant());
+				}
+			}
 			return op_error("NO_UNDO", "call has no journaled inverse; use mode untracked after granting tier untracked: " + method);
 		}
 		Array args;
@@ -1128,10 +1384,32 @@ BridgeResult Bridge::dispatch_op(const BridgeOp &op, const std::shared_ptr<TxSta
 				? (Object *)target_node->get_parent() : nullptr;
 		String prior_name = (method == "set_name" && target_node)
 				? String(target_node->get_name()) : String();
+		static const char *tf_mutators[] = {
+				"look_at", "look_at_from_position", "translate", "translate_object_local",
+				"rotate", "rotate_object_local", "rotate_x", "rotate_y", "rotate_z",
+				"scale_object_local", "global_rotate", "global_scale", "global_translate",
+				"orthonormalize"};
+		bool tf_mutator = false;
+		for (const char *m : tf_mutators) {
+			if (method == m) {
+				tf_mutator = true;
+			}
+		}
 		Variant prior_tf;
-		if (method == "look_at" || method == "look_at_from_position") {
+		if (tf_mutator) {
 			prior_tf = target->get("global_transform");
 		}
+		bool visibility_call = method == "show" || method == "hide";
+		bool group_call = method == "add_to_group" || method == "remove_from_group";
+		bool focus_call = method == "grab_focus" || method == "release_focus";
+		Variant prior_visible;
+		if (visibility_call) {
+			prior_visible = target->get("visible");
+		}
+		int64_t prior_index = (method == "move_child" && child_node)
+				? (int64_t)child_node->get_index() : -1;
+		Node *sibling_parent = (method == "add_sibling" && target_node)
+				? target_node->get_parent() : nullptr;
 
 		BridgeResult invoked = invoke_checked(target, StringName(method), args);
 		if (!invoked.ok) return invoked;
@@ -1165,11 +1443,41 @@ BridgeResult Bridge::dispatch_op(const BridgeOp &op, const std::shared_ptr<TxSta
 			f["m"] = "set_name"; f["a0"] = args.size() > 0 ? args[0] : Variant();
 			i["m"] = "set_name"; i["a0"] = prior_name;
 			journal(tx.get(), f, i);
-		} else if ((method == "look_at" || method == "look_at_from_position") &&
+		} else if (tf_mutator &&
 				(prior_tf.get_type() == Variant::TRANSFORM3D || prior_tf.get_type() == Variant::TRANSFORM2D)) {
 			Dictionary f = simple_op("callv", oid), i = simple_op("set", oid);
 			f["m"] = method; f["aa"] = args;
 			i["prop"] = "global_transform"; i["val"] = prior_tf;
+			journal(tx.get(), f, i);
+		} else if (visibility_call && prior_visible.get_type() == Variant::BOOL) {
+			Dictionary f = simple_op("callv", oid), i = simple_op("set", oid);
+			f["m"] = method; f["aa"] = args;
+			i["prop"] = "visible"; i["val"] = prior_visible;
+			journal(tx.get(), f, i);
+		} else if (group_call && args.size() > 0) {
+			Dictionary f = simple_op("callv", oid), i = simple_op("callv", oid);
+			f["m"] = method; f["aa"] = args;
+			i["m"] = method == "add_to_group" ? "remove_from_group" : "add_to_group";
+			i["aa"] = args;
+			journal(tx.get(), f, i);
+		} else if (method == "move_child" && child_node && prior_index >= 0) {
+			Dictionary f = simple_op("callv", oid), i = simple_op("callv", oid);
+			f["m"] = "move_child"; f["aa"] = args;
+			i["m"] = "move_child";
+			Array ia; ia.push_back(Variant(child)); ia.push_back(prior_index);
+			i["aa"] = ia;
+			journal(tx.get(), f, i);
+		} else if (method == "add_sibling" && sibling_parent && child_node) {
+			Dictionary f = simple_op("callv", oid);
+			Dictionary i = simple_op("call", (uint64_t)sibling_parent->get_instance_id());
+			f["m"] = "add_sibling"; f["aa"] = args;
+			i["m"] = "remove_child"; i["a0"] = Variant(child);
+			journal(tx.get(), f, i);
+		} else if (focus_call) {
+			Dictionary f = simple_op("callv", oid), i = simple_op("callv", oid);
+			f["m"] = method; f["aa"] = args;
+			i["m"] = method == "grab_focus" ? "release_focus" : "grab_focus";
+			i["aa"] = args;
 			journal(tx.get(), f, i);
 		}
 		BridgeResult r = encoded_result(v);
@@ -1180,7 +1488,38 @@ BridgeResult Bridge::dispatch_op(const BridgeOp &op, const std::shared_ptr<TxSta
 	return op_error("BAD_OP", "unknown op kind");
 }
 
+void Bridge::refresh_catalog() {
+	if (!index) return;
+	Variant scripts = plugin_discovery.is_valid() ? plugin_discovery.call() : Variant(Array());
+	script_metadata = scripts.get_type() == Variant::ARRAY ? (Array)scripts : Array();
+	Dictionary operations;
+	for (const Variant &name : plugin_methods.keys()) {
+		Dictionary definition = plugin_methods[name];
+		Object *provider = ObjectDB::get_instance(ObjectID((uint64_t)definition["provider"]));
+		if (!provider) continue;
+		Dictionary entry = definition.duplicate(true);
+		entry.erase("provider");
+		bool available = provider->has_method(String(definition.get("method", "")));
+		if (!(bool)definition.get("read_only", false) && String(definition.get("effect", "transaction")) != "external") {
+			available = available && provider->has_method(String(definition.get("capture", ""))) &&
+					provider->has_method(String(definition.get("restore", "")));
+		}
+		entry["available"] = available;
+		operations[name] = entry;
+	}
+	index->publish_catalog(script_metadata, operations);
+}
+
 void Bridge::drain(double budget_ms) {
+	bool removed = false;
+	for (const Variant &name : plugin_methods.keys()) {
+		Dictionary entry = plugin_methods[name];
+		if (!ObjectDB::get_instance(ObjectID((uint64_t)entry["provider"]))) {
+			plugin_methods.erase(name);
+			removed = true;
+		}
+	}
+	if (removed) refresh_catalog();
 	auto start = std::chrono::steady_clock::now();
 	while (true) {
 		std::shared_ptr<PendingBridge> pb;
@@ -1212,6 +1551,7 @@ void Bridge::drain(double budget_ms) {
 				pb->result = op_value(d);
 			} else if (policy == "allow") {
 				index->unlock_tier(tier);
+				refresh_catalog();
 				Dictionary d;
 				d["granted"] = true;
 				d["tier"] = tier;
@@ -1235,10 +1575,7 @@ void Bridge::drain(double budget_ms) {
 		} else {
 			pb->result = execute_op(pb->op, pb->tx);
 			if (pb->result.ok && pb->result.write && pb->tx && !pb->tx->untracked) {
-				Dictionary ch;
-				ch["op"] = pb->op.kind.c_str();
-				ch["member"] = pb->op.member.c_str();
-				pb->tx->changes.push_back(ch);
+				record_change(handles, pb->tx.get(), pb->op);
 			}
 		}
 		pb->done.store(true);
@@ -1267,6 +1604,7 @@ void Bridge::resolve_tier(const String &tier, bool granted) {
 		parked.swap(it->second);
 		tier_waiters.erase(it);
 	}
+	if (granted) refresh_catalog();
 	for (auto &pb : parked) {
 		if (pb->cancel && pb->cancel->load()) {
 			pb->result = op_error("CANCELLED", "operation cancelled");

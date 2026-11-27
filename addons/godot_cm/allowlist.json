@@ -174,6 +174,11 @@
 			"methods": [
 				"get_edited_scene_root",
 				"get_open_scene_roots",
+				"get_open_scenes",
+				"get_selected_paths",
+				"get_resource_filesystem",
+				"get_editor_paths",
+				"get_script_editor",
 				"get_editor_undo_redo",
 				"edit_node",
 				"edit_resource",

@@ -52,6 +52,11 @@ protected:
 	static void _bind_methods();
 
 public:
+	bool register_plugin_method(const godot::String &name, godot::Object *provider,
+			const godot::Dictionary &definition);
+	void unregister_plugin_method(const godot::String &name);
+	void set_plugin_discovery(const godot::Callable &callback);
+	void refresh_catalog();
 	bool start(int p_port);
 	void stop();
 	bool is_running() const;

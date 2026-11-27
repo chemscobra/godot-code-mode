@@ -3,12 +3,18 @@ extends EditorPlugin
 
 const DEFAULT_PORT := 8765
 const MAX_PORT_TRIES := 10
+const EditorOperations = preload("res://addons/godot_cm/editor_operations.gd")
+const RuntimeDebugger = preload("res://addons/godot_cm/runtime_debugger.gd")
+
+var _editor_operations
+var _runtime_debugger: EditorDebuggerPlugin
 
 var _runner: RefCounted
 var _service: RefCounted
 var _dock: HBoxContainer
 var _status: Label
 var _startup_generation := 0
+var _catalog_refresh_pending := false
 
 # Catppuccin Mocha palette
 const MOCHA := {
@@ -50,6 +56,26 @@ func _start_service(base: int, generation: int) -> void:
 		port += 1
 
 	if _service.is_running():
+		_runtime_debugger = RuntimeDebugger.new()
+		add_debugger_plugin(_runtime_debugger)
+		_editor_operations = EditorOperations.new()
+		_editor_operations.debugger = _runtime_debugger
+		_editor_operations.register(_service)
+		_service.set_plugin_discovery(_discover_project_classes)
+		_service.register_plugin_method("editor.camera3d", self, {
+			"method": "_get_editor_camera", "read_only": true,
+			"description": "Returns the editor 3D camera. Arguments: {viewport: 0..3}.",
+			"arguments": [{"name": "viewport", "type": "int", "default": 0}],
+			"return": "Camera3D",
+			"input_schema": {"type": "object", "properties": {
+				"viewport": {"type": "integer", "minimum": 0, "maximum": 3, "default": 0},
+			}},
+		})
+		var filesystem := get_editor_interface().get_resource_filesystem()
+		filesystem.filesystem_changed.connect(_queue_catalog_refresh)
+		filesystem.script_classes_updated.connect(_queue_catalog_refresh)
+		filesystem.resources_reload.connect(_queue_catalog_refresh)
+		get_editor_interface().get_base_control().set_meta("godot_cm_service", _service)
 		var msg := "godot-cm MCP server on 127.0.0.1:%d" % port
 		if port != base:
 			msg += " (default %d was busy)" % base
@@ -62,8 +88,43 @@ func _start_service(base: int, generation: int) -> void:
 		_build_dock(0, base)
 
 
+func _discover_project_classes() -> Array:
+	var classes := ProjectSettings.get_global_class_list().duplicate(true)
+	for entry in classes:
+		var path := String(entry.get("path", ""))
+		if ResourceLoader.has_cached(path):
+			var script := ResourceLoader.get_cached_ref(path) as Script
+			if script:
+				entry["methods"] = script.get_script_method_list()
+				entry["properties"] = script.get_script_property_list()
+				if not script.changed.is_connected(_queue_catalog_refresh):
+					script.changed.connect(_queue_catalog_refresh)
+	return classes
+
+
+func _queue_catalog_refresh(_paths: PackedStringArray = PackedStringArray()) -> void:
+	if not _catalog_refresh_pending:
+		_catalog_refresh_pending = true
+		_refresh_catalog.call_deferred()
+
+
+func _refresh_catalog() -> void:
+	_catalog_refresh_pending = false
+	if _service and _service.is_running():
+		_service.refresh_catalog()
+
+
+func _get_editor_camera(args: Dictionary) -> Dictionary:
+	var index := int(args.get("viewport", 0))
+	if index < 0 or index > 3:
+		return {"ok": false}
+	var viewport := get_editor_interface().get_editor_viewport_3d(index)
+	return {"ok": true, "result": viewport.get_camera_3d() if viewport else null}
+
+
 func _exit_tree() -> void:
 	_startup_generation += 1
+	get_editor_interface().get_base_control().remove_meta("godot_cm_service")
 	if _dock != null:
 		remove_control_from_bottom_panel(_dock)
 		_dock.queue_free()
@@ -71,6 +132,10 @@ func _exit_tree() -> void:
 	if _service != null:
 		_service.stop()
 		_service = null
+	if _runtime_debugger:
+		remove_debugger_plugin(_runtime_debugger)
+		_runtime_debugger = null
+	_editor_operations = null
 	_runner = null
 
 

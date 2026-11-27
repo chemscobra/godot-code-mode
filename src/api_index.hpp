@@ -11,18 +11,20 @@
 namespace godot_cm {
 
 // Immutable, allowlist-filtered API metadata index (design D4, spec api-discovery).
-// Built once at service start from extension_api.json + allowlist.json;
-// read concurrently by the JS worker for api.* bindings and the allowlist check.
+// Rebuilt from ClassDB + observed scripts + registered operations; published as
+// one shared snapshot per request. Qualified ids: native:<class>, script:<path>,
+// operation:<name>; ambiguous short names return candidate ids.
 class ApiCatalog {
-protected:
-	godot::Dictionary index; // class_name -> {inherits, methods[], properties[]}
+	godot::Dictionary entries;
+	godot::Dictionary aliases;
+	friend class ApiIndex;
 
 public:
-	explicit ApiCatalog(const godot::Dictionary &data = godot::Dictionary());
+	ApiCatalog();
 	~ApiCatalog();
-	godot::Array classes() const;                       // [{name, inherits}]
-	godot::Variant describe(const godot::String &name) const; // filtered detail or nil
-	godot::Array find(const godot::String &query) const;      // name substring matches
+	godot::Array classes() const;                             // [{id, name, inherits, kind, ...}]
+	godot::Variant describe(const godot::String &name) const; // full entry, id or unique name
+	godot::Array find(const godot::String &query) const;      // name/member/description matches
 };
 
 class ApiIndex : public ApiCatalog {
@@ -37,20 +39,31 @@ class ApiIndex : public ApiCatalog {
 	uint64_t revision = 0;
 	mutable std::mutex catalog_mutex;
 	std::shared_ptr<const ApiCatalog> catalog;
+	godot::Dictionary index; // class_name -> {inherits, methods[], properties[]}
 	godot::Dictionary tiered;   // class_name -> tier name (gated until unlocked)
 	godot::Dictionary tier_classes; // tier name -> [class names] (for UI)
 	godot::Dictionary unlocked; // tier name -> true
 	godot::Dictionary tier_policy;  // tier name (or "*") -> "allow"|"ask"|"deny"
 	bool loaded = false;
 	bool dirty = true;
+	godot::Dictionary denied_classes;  // passive deny metadata for godot.permissions
+	godot::Dictionary denied_members;  // class -> {member: true}
+	godot::Dictionary denied_global;   // meta-methods blocked everywhere
+	godot::Dictionary restricted;      // class -> {methods[], properties[]}
+	bool denylist_mode = false;
+	godot::Array script_metadata;
+	godot::Dictionary operation_metadata;
 
 public:
+	void publish_catalog(const godot::Array &scripts, const godot::Dictionary &operations);
+	void refresh_catalog();
 	bool load(const godot::String &allowlist_path);
 	bool is_loaded() const { return loaded; }
 	bool refresh(bool reconcile = false);
 	void invalidate(bool native = true);
 	void observe_script(godot::Object *object, bool inspect = true);
 	std::shared_ptr<const ApiCatalog> snapshot() const;
+	godot::Variant describe(const godot::String &name) const; // direct index lookup (native + script)
 	bool method_is_const(const godot::String &class_name, const godot::String &method) const;
 	godot::Dictionary member_info(const godot::String &class_name, const godot::String &member, bool property = false) const;
 	bool method_reversible(const godot::String &class_name, const godot::String &method) const;
@@ -77,6 +90,13 @@ public:
 	godot::Array tiers() const;
 	// Tier a class belongs to ("" if none / not locked).
 	godot::String tier_of(const godot::String &class_name) const;
+
+	// Passive permission introspection: never grants, never executes.
+	// {allowed, reason, tier?, policy?, locked?} for one class/member, or a
+	// tier/policy summary when class_name is empty.
+	godot::Dictionary permission_info(const godot::String &class_name,
+			const godot::String &member) const;
+	godot::Dictionary permissions_summary() const;
 
 	// Task 3.5: emit TypeScript declarations of exactly this index.
 	bool generate_dts(const godot::String &path) const;

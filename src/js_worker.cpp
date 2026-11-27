@@ -54,13 +54,11 @@ int interrupt_handler(JSContext * /*ctx*/, void *opaque) {
 }
 
 Dictionary base_result(bool ok) {
+	// Compact by default: diagnostics/changes/effects appear only when
+	// non-empty, truncated only when the result was actually cut.
 	Dictionary d;
 	d["ok"] = ok;
 	d["result"] = Variant();
-	d["diagnostics"] = Array();
-	d["changes"] = Array();
-	d["checkpoints"] = Array();
-	d["truncated"] = false;
 	return d;
 }
 
@@ -79,6 +77,7 @@ Dictionary error_result(const String &code, const String &message, const String 
 Dictionary bounded_response(Dictionary out) {
 	PerfScope cost(PerfMetric::FINAL_RESPONSE_NS);
 	for (const char *field : {"diagnostics", "effects", "changes"}) {
+		if (out.get(field, Variant()).get_type() != Variant::ARRAY) continue;
 		Array records = Array(out.get(field, Array())).duplicate();
 		for (int i = 0; i < records.size(); i++) {
 			if (records[i].get_type() != Variant::DICTIONARY) continue;
@@ -94,7 +93,7 @@ Dictionary bounded_response(Dictionary out) {
 			if (omitted) { record["omitted_characters"] = omitted; out["truncated"] = true; }
 			records[i] = record;
 		}
-		out[field] = records;
+		if (records.is_empty()) out.erase(field); else out[field] = records;
 	}
 	auto fits = [&]() { return Performance::json(out).utf8().length() <= OUTPUT_LIMIT; };
 	if (fits()) return out;
@@ -159,6 +158,15 @@ JSValue variant_to_js(JSContext *ctx, const Variant &v) {
 			return obj;
 		}
 		default: {
+			if (v.get_type() >= Variant::PACKED_BYTE_ARRAY &&
+					v.get_type() <= Variant::PACKED_VECTOR4_ARRAY) {
+				Array a = v;
+				JSValue arr = JS_NewArray(ctx);
+				for (int i = 0; i < a.size(); i++) {
+					JS_SetPropertyUint32(ctx, arr, i, variant_to_js(ctx, a[i]));
+				}
+				return arr;
+			}
 			CharString s = v.stringify().utf8();
 			return JS_NewStringLen(ctx, s.get_data(), s.length());
 		}
@@ -521,6 +529,22 @@ JSValue guarded(JSContext *ctx, JSValueConst self, int argc, JSValueConst *argv)
 // Recursively resolves {"$t":...} tagged engine types inside arrays and
 // dictionaries so e.g. [{$t:"Vector2",...}, ...] becomes real Vector2s
 // (which the bridge can then convert to PackedVector2Array etc.).
+static Vector2 tagged_vec2(const Variant &v) {
+	if (v.get_type() != Variant::DICTIONARY) {
+		return Vector2();
+	}
+	Dictionary d = v;
+	return Vector2((double)d.get("x", 0.0), (double)d.get("y", 0.0));
+}
+
+static Vector3 tagged_vec3(const Variant &v) {
+	if (v.get_type() != Variant::DICTIONARY) {
+		return Vector3();
+	}
+	Dictionary d = v;
+	return Vector3((double)d.get("x", 0.0), (double)d.get("y", 0.0), (double)d.get("z", 0.0));
+}
+
 Variant unwrap_tagged(const Variant &p) {
 	if (p.get_type() == Variant::ARRAY) {
 		Array a = p;
@@ -538,8 +562,22 @@ Variant unwrap_tagged(const Variant &p) {
 		if (t == "Vector2") {
 			return Vector2((double)d.get("x", 0.0), (double)d.get("y", 0.0));
 		}
+		if (t == "Vector2i") {
+			return Vector2i((int64_t)d.get("x", 0), (int64_t)d.get("y", 0));
+		}
 		if (t == "Vector3") {
 			return Vector3((double)d.get("x", 0.0), (double)d.get("y", 0.0), (double)d.get("z", 0.0));
+		}
+		if (t == "Vector3i") {
+			return Vector3i((int64_t)d.get("x", 0), (int64_t)d.get("y", 0), (int64_t)d.get("z", 0));
+		}
+		if (t == "Vector4") {
+			return Vector4((double)d.get("x", 0.0), (double)d.get("y", 0.0),
+					(double)d.get("z", 0.0), (double)d.get("w", 0.0));
+		}
+		if (t == "Vector4i") {
+			return Vector4i((int64_t)d.get("x", 0), (int64_t)d.get("y", 0),
+					(int64_t)d.get("z", 0), (int64_t)d.get("w", 0));
 		}
 		if (t == "Color") {
 			return Color((double)d.get("r", 0.0), (double)d.get("g", 0.0),
@@ -570,6 +608,42 @@ Variant unwrap_tagged(const Variant &p) {
 			if (t == "PackedVector3Array") return PackedVector3Array(items);
 			if (t == "PackedColorArray") return PackedColorArray(items);
 		}
+		if (t == "Quaternion") {
+			return Quaternion((double)d.get("x", 0.0), (double)d.get("y", 0.0),
+					(double)d.get("z", 0.0), (double)d.get("w", 1.0));
+		}
+		if (t == "Rect2") {
+			return Rect2(tagged_vec2(d.get("position", d.get("p", Dictionary()))),
+					tagged_vec2(d.get("size", d.get("s", Dictionary()))));
+		}
+		if (t == "Basis") {
+			return Basis(tagged_vec3(d.get("x", Dictionary())),
+					tagged_vec3(d.get("y", Dictionary())), tagged_vec3(d.get("z", Dictionary())));
+		}
+		if (t == "Transform3D") {
+			Variant basis_v = d.get("basis", Dictionary());
+			Basis b;
+			if (basis_v.get_type() == Variant::DICTIONARY) {
+				Dictionary basis_d = basis_v;
+				b = Basis(tagged_vec3(basis_d.get("x", Dictionary())),
+						tagged_vec3(basis_d.get("y", Dictionary())),
+						tagged_vec3(basis_d.get("z", Dictionary())));
+			}
+			return Transform3D(b, tagged_vec3(d.get("origin", Dictionary())));
+		}
+		if (t == "AABB") {
+			return AABB(tagged_vec3(d.get("position", Dictionary())),
+					tagged_vec3(d.get("size", Dictionary())));
+		}
+		if (t == "Plane") {
+			return Plane(tagged_vec3(d.get("normal", Dictionary())), (double)d.get("d", 0.0));
+		}
+		if (t == "NodePath") {
+			return NodePath(String(d.get("path", "")));
+		}
+		if (t == "StringName") {
+			return StringName(String(d.get("name", "")));
+		}
 		return p;
 	}
 	for (const Variant &k : d.keys()) {
@@ -581,7 +655,8 @@ Variant unwrap_tagged(const Variant &p) {
 bool arg_is_write(const char *kind, const char *member) {
 	String k = kind;
 	if (k == "create" || k == "set" || k == "save_scene" || k == "unlock_writes" ||
-			k == "connect" || k == "disconnect" || k == "value_release") {
+			k == "connect" || k == "disconnect" || k == "value_release" ||
+			k == "load_resource" || k == "instantiate_scene" || k == "plugin_call" || k == "plugin_action") {
 		return true;
 	}
 	if (k == "call") {
@@ -716,8 +791,72 @@ JSValue js_godot_singleton(JSContext *ctx, JSValueConst, int argc, JSValueConst 
 	return result;
 }
 
+JSValue js_godot_discover_plugins(JSContext *ctx, JSValueConst, int, JSValueConst *) {
+	return submit_op(ctx, "discover_plugins", 0, "", Array());
+}
+
+JSValue js_plugin_invoke(JSContext *ctx, int argc, JSValueConst *argv, const char *kind) {
+	if (argc < 1 || !JS_IsString(argv[0])) return JS_ThrowTypeError(ctx, "plugin method name required");
+	const char *name = JS_ToCString(ctx, argv[0]);
+	if (!name) return JS_EXCEPTION;
+	String method = String::utf8(name);
+	JS_FreeCString(ctx, name);
+	Array args;
+	if (argc > 1) args.push_back(js_to_variant(ctx, argv[1]));
+	return submit_op(ctx, kind, 0, method.utf8().get_data(), args);
+}
+
+JSValue js_godot_plugin_read(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
+	return js_plugin_invoke(ctx, argc, argv, "plugin_read");
+}
+
+JSValue js_godot_plugin_call(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
+	return js_plugin_invoke(ctx, argc, argv, "plugin_call");
+}
+
+JSValue js_godot_plugin_action(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
+	return js_plugin_invoke(ctx, argc, argv, "plugin_action");
+}
+
+// Facade for the trusted editor.attach_script operation registered by the
+// addon. Keeps Script/meta-methods denied while exposing an auditable path.
+JSValue js_godot_attach_script(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
+	if (argc < 2 || !JS_IsString(argv[1])) {
+		return JS_ThrowTypeError(ctx, "godot.attachScript(node, 'res://x.gd')");
+	}
+	Dictionary args;
+	args["node"] = js_to_variant(ctx, argv[0]);
+	args["path"] = js_to_variant(ctx, argv[1]);
+	Array a;
+	a.push_back(args);
+	return submit_op(ctx, "plugin_call", 0, "editor.attach_script", a);
+}
+
+JSValue js_godot_load_resource(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
+	if (argc < 1 || !JS_IsString(argv[0])) return JS_ThrowTypeError(ctx, "godot.loadResource(path)");
+	const char *name = JS_ToCString(ctx, argv[0]);
+	if (!name) return JS_EXCEPTION;
+	String path = String::utf8(name);
+	JS_FreeCString(ctx, name);
+	return submit_op(ctx, "load_resource", 0, path.utf8().get_data(), Array());
+}
+
+JSValue js_godot_instantiate_scene(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
+	if (argc < 1) return JS_ThrowTypeError(ctx, "godot.instantiateScene(packedScene)");
+	return submit_op(ctx, "instantiate_scene", handle_id_of(ctx, argv[0]), "", Array());
+}
+
 JSValue js_godot_editor_scene(JSContext *ctx, JSValueConst, int, JSValueConst *) {
 	return submit_op(ctx, "editor_scene_root", 0, "", Array());
+}
+
+JSValue js_godot_scene_tree(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
+	Array args;
+	if (argc > 1) {
+		args.push_back(js_to_variant(ctx, argv[1]));
+	}
+	uint64_t target = argc > 0 ? handle_id_of(ctx, argv[0]) : 0;
+	return submit_op(ctx, "scene_tree", target, "", args);
 }
 
 JSValue js_godot_save_scene(JSContext *ctx, JSValueConst, int, JSValueConst *) {
@@ -744,6 +883,14 @@ JSValue js_godot_request_tier(JSContext *ctx, JSValueConst, int argc, JSValueCon
 
 JSValue js_godot_unlocked_tiers(JSContext *ctx, JSValueConst, int, JSValueConst *) {
 	return submit_op(ctx, "unlocked_tiers", 0, "", Array());
+}
+
+JSValue js_godot_permissions(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
+	Array args;
+	if (argc > 0 && !JS_IsUndefined(argv[0]) && !JS_IsNull(argv[0])) {
+		args.push_back(js_to_variant(ctx, argv[0]));
+	}
+	return submit_op(ctx, "permissions", 0, "", args);
 }
 
 // godot.batch(ops): ops are plain objects {op, target?, prop?|method?|member?,
@@ -1023,11 +1170,13 @@ Dictionary JsWorker::execute_one(const ExecRequest &req) {
 
 	ExecCtx ec;
 	ec.bridge = bridge;
+	ec.catalog = api_index ? api_index->snapshot() : nullptr;
 	ec.budget = &budget;
 	ec.mode = req.mode;
 	ec.cancel = req.cancel ? req.cancel : std::make_shared<std::atomic<bool>>(false);
 	ec.tx = req.tx ? req.tx : std::make_shared<TxState>();
 	ec.tx->untracked = req.mode == "untracked";
+	ec.tx->verbose = req.verbose;
 	if (api_index) ec.catalog = api_index->snapshot();
 	JS_SetContextOpaque(ctx, &ec);
 
@@ -1067,6 +1216,33 @@ Dictionary JsWorker::execute_one(const ExecRequest &req) {
 		JS_SetPropertyStr(ctx, api_obj, "describe", JS_NewCFunction(ctx, guarded<js_api_describe>, "describe", 1));
 		JS_SetPropertyStr(ctx, api_obj, "find", JS_NewCFunction(ctx, guarded<js_api_find>, "find", 1));
 		JS_SetPropertyStr(ctx, global, "api", api_obj);
+
+		// Tagged-value cookbook: api.example("Transform3D") returns the wire
+		// representation godot.set/call accept for that engine type.
+		static const char *api_prelude = R"JS(
+api.example = function(type) {
+	const v3 = {x:1,y:0,z:0}, y3 = {x:0,y:1,z:0}, z3 = {x:0,y:0,z:1};
+	const E = {
+		Vector2: {$t:'Vector2', x:1.5, y:-2.0},
+		Vector2i: {$t:'Vector2i', x:1, y:2},
+		Vector3: {$t:'Vector3', x:1.5, y:-2.0, z:3.25},
+		Vector3i: {$t:'Vector3i', x:1, y:2, z:3},
+		Vector4: {$t:'Vector4', x:1, y:2, z:3, w:4},
+		Vector4i: {$t:'Vector4i', x:1, y:2, z:3, w:4},
+		Color: {$t:'Color', r:1.0, g:0.5, b:0.0, a:1.0},
+		Quaternion: {$t:'Quaternion', x:0, y:0, z:0, w:1},
+		Rect2: {$t:'Rect2', position:{x:0,y:0}, size:{x:10,y:20}},
+		Basis: {$t:'Basis', x:v3, y:y3, z:z3},
+		Transform3D: {$t:'Transform3D', basis:{x:v3, y:y3, z:z3}, origin:{x:0,y:1,z:-5}},
+		AABB: {$t:'AABB', position:{x:0,y:0,z:0}, size:{x:1,y:1,z:1}},
+		Plane: {$t:'Plane', normal:{x:0,y:1,z:0}, d:0},
+		NodePath: {$t:'NodePath', path:'Player/Camera'},
+		StringName: {$t:'StringName', name:'idle'},
+	};
+	return E[type] || null;
+};
+)JS";
+		JS_FreeValue(ctx, JS_Eval(ctx, api_prelude, strlen(api_prelude), "<godot-cm-api>", JS_EVAL_TYPE_GLOBAL));
 	}
 
 	if (!req.search_only) {
@@ -1079,7 +1255,14 @@ Dictionary JsWorker::execute_one(const ExecRequest &req) {
 		JS_SetPropertyStr(ctx, values, "release", JS_NewCFunction(ctx, guarded<js_value_release>, "release", 1));
 		JS_SetPropertyStr(ctx, godot_obj, "values", values);
 		JS_SetPropertyStr(ctx, godot_obj, "create", JS_NewCFunction(ctx, guarded<js_godot_create>, "create", 1));
+		JS_SetPropertyStr(ctx, godot_obj, "discoverPlugins", JS_NewCFunction(ctx, guarded<js_godot_discover_plugins>, "discoverPlugins", 0));
+		JS_SetPropertyStr(ctx, godot_obj, "pluginRead", JS_NewCFunction(ctx, guarded<js_godot_plugin_read>, "pluginRead", 2));
+		JS_SetPropertyStr(ctx, godot_obj, "pluginCall", JS_NewCFunction(ctx, guarded<js_godot_plugin_call>, "pluginCall", 2));
+		JS_SetPropertyStr(ctx, godot_obj, "pluginAction", JS_NewCFunction(ctx, guarded<js_godot_plugin_action>, "pluginAction", 2));
+		JS_SetPropertyStr(ctx, godot_obj, "attachScript", JS_NewCFunction(ctx, guarded<js_godot_attach_script>, "attachScript", 2));
 		JS_SetPropertyStr(ctx, godot_obj, "getSingleton", JS_NewCFunction(ctx, guarded<js_godot_singleton>, "getSingleton", 1));
+		JS_SetPropertyStr(ctx, godot_obj, "loadResource", JS_NewCFunction(ctx, guarded<js_godot_load_resource>, "loadResource", 1));
+		JS_SetPropertyStr(ctx, godot_obj, "instantiateScene", JS_NewCFunction(ctx, guarded<js_godot_instantiate_scene>, "instantiateScene", 1));
 		JS_SetPropertyStr(ctx, godot_obj, "get", JS_NewCFunction(ctx, guarded<js_godot_get>, "get", 2));
 		JS_SetPropertyStr(ctx, godot_obj, "set", JS_NewCFunction(ctx, guarded<js_godot_set>, "set", 3));
 		JS_SetPropertyStr(ctx, godot_obj, "call", JS_NewCFunction(ctx, guarded<js_godot_call>, "call", 2));
@@ -1095,13 +1278,144 @@ Dictionary JsWorker::execute_one(const ExecRequest &req) {
 				JS_NewCFunction(ctx, guarded<js_godot_request_tier>, "requestTier", 1));
 		JS_SetPropertyStr(ctx, godot_obj, "unlockedTiers",
 				JS_NewCFunction(ctx, guarded<js_godot_unlocked_tiers>, "unlockedTiers", 0));
+		JS_SetPropertyStr(ctx, godot_obj, "permissions",
+				JS_NewCFunction(ctx, guarded<js_godot_permissions>, "permissions", 1));
 		JS_SetPropertyStr(ctx, godot_obj, "batch",
 				JS_NewCFunction(ctx, guarded<js_godot_batch>, "batch", 1));
 		JSValue editor_obj = JS_NewObject(ctx);
 		JS_SetPropertyStr(ctx, editor_obj, "getEditedScene",
 				JS_NewCFunction(ctx, js_godot_editor_scene, "getEditedScene", 0));
 		JS_SetPropertyStr(ctx, godot_obj, "editor", editor_obj);
+		JS_SetPropertyStr(ctx, godot_obj, "__sceneTree",
+				JS_NewCFunction(ctx, js_godot_scene_tree, "__sceneTree", 2));
 		JS_SetPropertyStr(ctx, global, "godot", godot_obj);
+
+		// Convenience layer built on the bridge primitives. Runs inside the
+		// user's execute call, so every op still counts against budgets and
+		// joins the same transaction.
+		static const char *prelude = R"JS(
+godot.build = async function(spec, options) {
+	const opts = options || {};
+	const nodes = [];
+	async function walk(s, parent) {
+		if (!s || typeof s !== 'object') {
+			const e = new Error('godot.build: node spec must be an object');
+			e.code = 'BAD_ARGS';
+			throw e;
+		}
+		const node = await godot.create(s.type || 'Node');
+		nodes.push(node);
+		if (s.name != null) {
+			await godot.call(node, 'set_name', String(s.name));
+		}
+		const props = s.props || {};
+		for (const k of Object.keys(props)) {
+			await godot.set(node, k, props[k]);
+		}
+		if (parent) {
+			await godot.call(parent, 'add_child', node);
+		}
+		for (const c of (s.children || [])) {
+			await walk(c, node);
+		}
+		return node;
+	}
+	const root = await walk(spec, opts.parent || null);
+	// Ownership: attached trees get the edited scene root as owner (when the
+	// parent actually lives there); detached trees own their descendants.
+	let owner = root;
+	const attached = !!opts.parent;
+	if (attached) {
+		try {
+			const sceneRoot = await godot.editor.getEditedScene();
+			if (sceneRoot && await godot.call(sceneRoot, 'is_ancestor_of', nodes[0])) {
+				owner = sceneRoot;
+			}
+		} catch (e) {}
+	}
+	for (let i = attached ? 0 : 1; i < nodes.length; i++) {
+		await godot.call(nodes[i], 'set_owner', owner);
+	}
+	return root;
+};
+
+godot.scene = {};
+godot.scene.new = async function(path, options) {
+	const o = options || {};
+	const args = { path: path, root_type: o.type || 'Node3D' };
+	if (o.name != null) {
+		args.name = String(o.name);
+	}
+	await godot.pluginAction('editor.create_scene', args);
+	for (let i = 0; i < 300; i++) {
+		const st = await godot.pluginRead('editor.state');
+		if (st && st.scene === path) {
+			const r = await godot.editor.getEditedScene();
+			if (r) return r;
+		}
+	}
+	const e = new Error('timed out waiting for ' + path + ' to open');
+	e.code = 'SCENE_OPEN_TIMEOUT';
+	throw e;
+};
+godot.scene.reload = async function(path) {
+	let target = path;
+	if (!target) {
+		const st0 = await godot.pluginRead('editor.state');
+		target = st0 && st0.scene;
+	}
+	if (!target) {
+		const e = new Error('no scene open and no path given');
+		e.code = 'BAD_ARGS';
+		throw e;
+	}
+	await godot.pluginAction('editor.reload_scene', { path: target });
+	for (let i = 0; i < 300; i++) {
+		const st = await godot.pluginRead('editor.state');
+		if (st && st.scene === target) {
+			const r = await godot.editor.getEditedScene();
+			if (r) return r;
+		}
+	}
+	const e = new Error('timed out waiting for ' + target + ' to reopen');
+	e.code = 'SCENE_RELOAD_TIMEOUT';
+	throw e;
+};
+godot.scene.tree = async function(options) {
+	const o = options || {};
+	return await godot.__sceneTree(o.root || null, {
+		depth: o.depth == null ? 32 : o.depth,
+		maxNodes: o.maxNodes == null ? 2000 : o.maxNodes,
+	});
+};
+godot.scene.run = async function() {
+	await godot.pluginAction('editor.play_scene', {});
+	for (let i = 0; i < 300; i++) {
+		const st = await godot.pluginRead('editor.state');
+		if (st && st.playing) {
+			return { playing: true, scene: st.scene, console: 'unavailable' };
+		}
+	}
+	const e = new Error('timed out waiting for playback to start');
+	e.code = 'PLAY_TIMEOUT';
+	throw e;
+};
+godot.scene.stop = async function() {
+	await godot.pluginAction('editor.stop_scene', {});
+};
+)JS";
+		JSValue prelude_val = JS_Eval(ctx, prelude, strlen(prelude), "<godot-cm-prelude>", JS_EVAL_TYPE_GLOBAL);
+		if (JS_IsException(prelude_val)) {
+			JSValue exc = JS_GetException(ctx);
+			const char *msg = JS_ToCString(ctx, exc);
+			UtilityFunctions::push_error(String("[godot-cm] prelude eval failed: ") +
+					(msg ? String::utf8(msg) : String("?")));
+			if (msg) {
+				JS_FreeCString(ctx, msg);
+			}
+			JS_FreeValue(ctx, exc);
+		}
+		JS_FreeValue(ctx, prelude_val);
 	}
 
 	context_cost.stop();
@@ -1255,6 +1569,7 @@ Dictionary JsWorker::execute_one(const ExecRequest &req) {
 	// Transaction epilogue (spec editor-transactions): a successful write
 	// execution commits one undoable action; any failure rolls the journal
 	// back. Runs after the JS teardown — the journal lives Godot-side.
+	bool tx_rolled_back = false;
 	if (ec.tx && !ec.tx->journal.is_empty()) {
 		bool success = out.get("ok", false) && !ec.tx->conflict.load();
 		BridgeResult txr = wait_bridge_op(bridge,
@@ -1269,15 +1584,38 @@ Dictionary JsWorker::execute_one(const ExecRequest &req) {
 			diags.push_back(d);
 			out["diagnostics"] = diags;
 		}
+		tx_rolled_back = !success;
 	}
 	if (ec.tx) {
-		out["changes"] = ec.tx->changes;
-		out["effects"] = ec.tx->effects;
-		out["partial"] = req.mode == "untracked" && !(bool)out.get("ok", false) && !ec.tx->effects.is_empty();
+		// Compact report: counts grouped by "Class.op" plus the transaction
+		// outcome, so a rollback isn't presented as persisted changes.
+		if (!ec.tx->verbose && !ec.tx->change_counts.is_empty()) {
+			Dictionary c;
+			c["counts"] = ec.tx->change_counts;
+			int64_t total = 0;
+			for (const Variant &k : ec.tx->change_counts.keys()) {
+				total += (int64_t)ec.tx->change_counts[k];
+			}
+			c["total"] = total;
+			c["status"] = tx_rolled_back ? "rolled_back" : "committed";
+			out["changes"] = c;
+		} else if (ec.tx->verbose && !ec.tx->changes.is_empty()) {
+			out["changes"] = ec.tx->changes;
+		}
+		// External (non-rollbackable) effects stay visible even on failure.
+		if (!ec.tx->effects.is_empty()) {
+			out["effects"] = ec.tx->effects;
+		}
+		bool partial = req.mode == "untracked" && !(bool)out.get("ok", false) && !ec.tx->effects.is_empty();
+		if (partial) out["partial"] = true;
+		if (ec.tx->verbose) {
+			out["mode"] = req.mode.c_str();
+			out["rollback_supported"] = req.mode == "write";
+		}
 	}
-	out["mode"] = req.mode.c_str();
-	out["rollback_supported"] = req.mode == "write";
-	out["checkpoints"] = ec.checkpoints;
+	if (!ec.checkpoints.is_empty()) {
+		out["checkpoints"] = ec.checkpoints;
+	}
 	// Op warnings (e.g. MIXED_SPACE) surface as diagnostics; the op itself
 	// already applied — the agent decides whether to act on the hint.
 	if (!ec.warnings.is_empty()) {

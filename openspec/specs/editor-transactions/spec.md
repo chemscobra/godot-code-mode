@@ -48,3 +48,30 @@ After a partial rollback locks writes, the system SHALL provide an explicit, use
 #### Scenario: Operator clears write lock
 - **WHEN** writes are locked after a partial rollback and the operator invokes the unlock action
 - **THEN** subsequent write-mode `execute` calls are permitted again and the unlock event is reported in diagnostics
+
+### Requirement: Trusted script attachment
+A trusted plugin operation `editor.attach_script` SHALL assign a non-@tool `.gd` script to a node undoably, gated by the filesystem tier. The op SHALL validate a canonical `res://` path, file existence, `Script` type, and base-type compatibility before mutating, and SHALL capture the prior script for restore. `Script` classes and meta-methods SHALL remain denied.
+
+#### Scenario: Attach and roll back
+- **WHEN** `godot.attachScript(node, path)` applies and the transaction fails
+- **THEN** the node's prior script (or none) is restored
+
+#### Scenario: Unsafe scripts refused
+- **WHEN** the script is `@tool`, missing, non-canonical, or has an incompatible base type
+- **THEN** the op fails before any mutation
+
+### Requirement: Extended journaled inverse set
+The journaled set SHALL include transform mutators (inverted by restoring
+`global_transform`), `show`/`hide` (via the `visible` property),
+`add_to_group`/`remove_from_group` (inverse pair), `move_child` (prior
+index), `add_sibling` (`remove_child` on the captured parent), and
+`grab_focus`/`release_focus` (inverse pair). `set_x` calls SHALL route to
+the journaled `set` path when the property is authorized.
+
+#### Scenario: Transform mutator rolls back
+- **WHEN** code calls `translate`/`rotate`/`scale_object_local` and the transaction later fails
+- **THEN** `global_transform` is restored to the captured prior value
+
+#### Scenario: Group and sibling calls invert
+- **WHEN** `add_to_group` or `add_sibling` applies and the transaction fails
+- **THEN** `remove_from_group` or `remove_child` on the captured parent restores the prior structure

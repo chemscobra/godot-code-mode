@@ -30,6 +30,10 @@ static const char *SERVER_NAME = "godot-cm";
 static const char *SERVER_VERSION = "0.3.1";
 
 void McpService::_bind_methods() {
+	ClassDB::bind_method(D_METHOD("register_plugin_method", "name", "provider", "definition"), &McpService::register_plugin_method);
+	ClassDB::bind_method(D_METHOD("unregister_plugin_method", "name"), &McpService::unregister_plugin_method);
+	ClassDB::bind_method(D_METHOD("set_plugin_discovery", "callback"), &McpService::set_plugin_discovery);
+	ClassDB::bind_method(D_METHOD("refresh_catalog"), &McpService::refresh_catalog);
 	ClassDB::bind_method(D_METHOD("start", "port"), &McpService::start);
 	ClassDB::bind_method(D_METHOD("stop"), &McpService::stop);
 	ClassDB::bind_method(D_METHOD("is_running"), &McpService::is_running);
@@ -166,7 +170,12 @@ Variant McpService::handle_tools_list(const Variant &id) {
 
 	Dictionary search;
 	search["name"] = "search";
-	search["description"] = "Run read-only JS over a consistent snapshot of the runtime API catalog (api.classes/api.describe/api.find), including installed native extensions and project script classes. api.types() lists all 39 Variant types; api.describeType(name) gives named/contextual and explicit $t formats, inline/opaque outputs, numeric limits and reference-only restrictions. Uncached scripts have partial metadata; discovery never loads or instantiates them. Declared type descriptors retain variant_type, class_name, hints, collection constraints and argument defaults. Variant/untyped metadata does not supply concrete conversion context. Discovering metadata does not authorize its execution.";
+	search["description"] = "Run read-only JS over a consistent snapshot of the runtime API catalog (api.classes/api.describe/api.find), including installed native extensions, project script classes and live registered plugin operations. "
+			"api.types() lists all 39 Variant types; api.describeType(name) gives named/contextual and explicit $t formats, inline/opaque outputs, numeric limits and reference-only restrictions. "
+			"Entries expose kind, source, signatures where available, permissions and execution/undo contracts. "
+			"Use qualified ids native:<class>, script:<path>, operation:<name> to disambiguate; describe returns matches for ambiguous short names. "
+			"Uncached scripts have partial metadata; discovery never loads or instantiates them. Declared type descriptors retain variant_type, class_name, hints, collection constraints and argument defaults. "
+			"Variant/untyped metadata does not supply concrete conversion context. Discovering metadata does not authorize its execution.";
 	Dictionary search_schema;
 	search_schema["type"] = "object";
 	Dictionary search_props;
@@ -199,7 +208,13 @@ Variant McpService::handle_tools_list(const Variant &id) {
 			"Checkpoints survive failure but are historical data/references, not locals recovery, current scene state or rollback guarantees. "
 			"Errors keep original codes, paths and available source locations; intrinsic Error.prepareStackTrace/stackTraceLimit are reserved. "
 			"The execution envelope is bounded to 256 KiB; truncated, result_omitted and *_omitted report omissions. "
-			"Invocation success is not proof of plugin-domain success.";
+			"Invocation success is not proof of plugin-domain success. "
+			"Registered plugin operations: godot.pluginRead(name, args) for read ops, godot.pluginCall(name, args) in write mode for undoable ops, godot.pluginAction(name, args) for declared external actions. "
+			"Use godot.pluginRead('editor.camera3d', {viewport: 0}) for the editor camera. Plugin operations must be registered by trusted editor code. "
+			"Higher-level helpers: godot.build({type,name,props,children},{parent}) builds a node tree in one call with automatic owners; "
+			"godot.scene.new(path) creates and opens a scene, godot.scene.reload(path?) reopens it, godot.scene.tree() inspects it, godot.scene.run()/stop() control playback; "
+			"godot.attachScript(node,'res://x.gd') assigns a non-@tool script undoably; "
+			"godot.permissions({class,member}) explains why a call is allowed or denied; api.example(type) returns a wire value for tagged engine types.";
 	Dictionary exec_schema;
 	exec_schema["type"] = "object";
 	Dictionary exec_props;
@@ -219,6 +234,14 @@ Variant McpService::handle_tools_list(const Variant &id) {
 	mode_prop["enum"] = modes;
 	mode_prop["default"] = "read";
 	exec_props["mode"] = mode_prop;
+	Dictionary verbose_prop;
+	verbose_prop["type"] = "boolean";
+	verbose_prop["default"] = false;
+	verbose_prop["description"] =
+			"By default responses stay compact: empty fields are omitted and changes "
+			"are summarized as {counts: {\"Class.op\": n}, total, status}. "
+			"verbose: true returns the ordered per-op change log.";
+	exec_props["verbose"] = verbose_prop;
 	exec_schema["properties"] = exec_props;
 	Array exec_req;
 	exec_req.push_back("code");
@@ -262,6 +285,7 @@ Variant McpService::handle_tools_call(const Variant &id, const Dictionary &param
 		if (args.has("timeoutMs")) {
 			req.timeout_ms = (int64_t)args["timeoutMs"];
 		}
+		req.verbose = (bool)args.get("verbose", false);
 		req.cancel = std::make_shared<std::atomic<bool>>(false);
 		req.tx = std::make_shared<TxState>();
 		String rid = id.stringify();
@@ -350,6 +374,51 @@ Variant McpService::dispatch_rpc(const Dictionary &request) {
 	error["message"] = "method not found";
 	response["error"] = error;
 	return response;
+}
+
+bool McpService::register_plugin_method(const String &name, Object *provider, const Dictionary &definition) {
+	if (!bridge || !provider || name.is_empty()) return false;
+	if (bridge->plugin_methods.has(name)) {
+		Dictionary existing = bridge->plugin_methods[name];
+		uint64_t owner = existing["provider"];
+		if (ObjectDB::get_instance(ObjectID(owner)) && owner != (uint64_t)provider->get_instance_id()) return false;
+	}
+	String method = definition.get("method", "");
+	bool read_only = definition.get("read_only", false);
+	String effect = definition.get("effect", read_only ? "read" : "transaction");
+	if (effect != "read" && effect != "transaction" && effect != "external") return false;
+	if (read_only != (effect == "read")) return false;
+	String capture = definition.get("capture", "");
+	String restore = definition.get("restore", "");
+	String tier = definition.get("tier", "");
+	if (!provider->has_method(method) || (!tier.is_empty() && !api_index->has_tier(tier))) return false;
+	if (effect == "transaction" && (capture.is_empty() || restore.is_empty() ||
+			!provider->has_method(capture) || !provider->has_method(restore))) return false;
+	Dictionary entry = definition.duplicate(true);
+	entry["provider"] = (uint64_t)provider->get_instance_id();
+	entry["read_only"] = read_only;
+	entry["effect"] = effect;
+	bridge->plugin_methods[name] = entry;
+	bridge->refresh_catalog();
+	return true;
+}
+
+void McpService::unregister_plugin_method(const String &name) {
+	if (bridge) {
+		bridge->plugin_methods.erase(name);
+		bridge->refresh_catalog();
+	}
+}
+
+void McpService::set_plugin_discovery(const Callable &callback) {
+	if (bridge) {
+		bridge->plugin_discovery = callback;
+		bridge->refresh_catalog();
+	}
+}
+
+void McpService::refresh_catalog() {
+	if (bridge) bridge->refresh_catalog();
 }
 
 bool McpService::start(int p_port) {
