@@ -23,6 +23,10 @@ Project → Project Settings → Plugins.
 **Manual** — copy `addons/godot_cm/` into your project's `addons/` folder and
 enable the plugin the same way (a symlink works for development).
 
+**From source** — the compiled `bin/` binaries are not tracked in this repo:
+clone + `git submodule update --init`, build per `AGENTS.md` (or grab a
+`dist/godot_cm-*.zip` release artifact, which ships them).
+
 ```
 your-project/
 └── addons/godot_cm/

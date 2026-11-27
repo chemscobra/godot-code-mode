@@ -16,6 +16,7 @@ the MCP protocol or Godot engine version.
 - `effects` collapses to `{counts, total}` unless `verbose: true` — large `godot.build` results no longer emit ~100 per-op entries.
 - `godot.permissions()` serializes correctly instead of failing with `INVALID_VALUE_ENCODING`.
 - Linux integration and both native builds pass; Windows was cross-built, not run.
+- Repo hygiene: `bin/*.so|.dll` binaries are no longer tracked — they ship via `dist/` release zips and are rebuilt locally, so fresh clones must build (or install a zip) instead of getting binaries from git.
 
 ## 0.3.2
 
