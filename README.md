@@ -6,7 +6,9 @@ that awaits authorized editor operations. Supported edits can be grouped into
 one undoable editor action; an explicit `untracked` mode also permits calls
 whose effects cannot be rolled back.
 
+- Current addon version: **0.3.1** — [release notes](CHANGELOG.md)
 - Godot floor: **4.7** (validated on 4.7.2, linux-x86_64)
+- Platforms: Linux x86-64 tested; Windows x86-64 cross-built, runtime unverified.
 - MCP spec: **2025-11-25** (Streamable HTTP on loopback + stdio adapter)
 - License: **MIT** (see `LICENSE`; bundled components in
   `addons/godot_cm/THIRD_PARTY_LICENSES.txt`)
@@ -30,7 +32,7 @@ your-project/
     ├── tools/godot_cm_stdio.py # stdio adapter for MCP clients
     ├── allowlist.json            # permission config: denylist, tiers, policies
     ├── api-surface.d.ts          # generated declarations for the exposed API
-    ├── extension_api.json        # 4.7.2 dump, seed of the search index
+    ├── extension_api.json        # 4.7.2 reference dump; discovery uses ClassDB
     ├── LICENSE
     └── THIRD_PARTY_LICENSES.txt
 ```
@@ -298,13 +300,52 @@ Default cooperative budgets: 5 s for read and 60 s for write/untracked (adjust
 via `timeoutMs`), 32 MiB JS heap, 1,000 operations and a 256 KiB execution
 envelope before MCP wrapping. Native methods cannot be forcibly interrupted.
 
+## Performance and verification
+
+Version 0.3.1 reuses catalog metadata with freshness checks, constructs bounded
+pages without repeatedly encoding their prefixes, and avoids a redundant JSON
+parse for compatible passive worker results. Permissions, codec validation,
+quotas, request isolation and single-dispatch batch semantics are unchanged.
+
+In the isolated minimal-topology comparison against 0.3.0, median latency fell
+from **263.4 to 6.8 ms** for 100-read batches, **1294.6 to 20.9 ms** for
+500-read batches, and **14.0 to 6.7 ms** for 256-element pages. The primary
+matrix includes 21,600 measured samples across three topologies and three
+alternating rounds. These are workload-specific measurements, not an SLA.
+
+There are trade-offs: median direct startup increased from **704.5 to 798 ms**,
+and conservative reconciliation can make unknown-effect/script calls slower.
+Single operations and small pages have no general speedup claim. A native call
+can still block beyond the cooperative budget; batches are not split across
+frames. See [benchmarks](docs/benchmarks.md) for raw-report locations, binary
+identities, p95, rendered-editor tests, limitations and reproduction commands.
+
+Development profiling is opt-in via `GODOT_CM_PROFILE=1` when launching Godot.
+It emits fixed aggregate counters/timings on the process output, not new MCP
+fields or tools. It excludes submitted code, argument/result contents,
+credentials, project paths and object identifiers. Profiling has overhead;
+leave it disabled for normal use and primary latency comparisons.
+
+After building, run the isolated integration suite and harness tests:
+
+```bash
+python3 -B tools/test_generic_bridge.py
+python3 -B -m unittest discover -s tools -p test_bridge_benchmark.py -v
+```
+
+Tests create temporary projects rather than opening the example project. The
+release passes Linux integration, all 39 Variant fixture categories, nineteen
+harness tests and TypeScript declaration checks. Windows build success does not
+establish Windows runtime compatibility. See [AGENTS.md](AGENTS.md) for catalog
+lifetime tests, declaration checks and the complete verification commands.
+
 ## Build
 
 Linux (host build):
 
 ```
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
+cmake -B build -DGODOTCPP_TARGET=editor -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j 6
 ```
 
 Windows cross-compile (MinGW-w64 toolchain installed):
@@ -312,10 +353,11 @@ Windows cross-compile (MinGW-w64 toolchain installed):
 ```
 cmake -B build-windows -DCMAKE_TOOLCHAIN_FILE=toolchains/mingw-w64.cmake \
     -DGODOTCPP_TARGET=editor -DCMAKE_BUILD_TYPE=Release
-cmake --build build-windows -j
+cmake --build build-windows -j 6
 ```
 
-Output lands directly in `addons/godot_cm/bin/` (`.so` / `.dll` — the
-Windows build is fully static, no MinGW runtime DLLs needed on the target
-machine). `godot-cpp/` is a submodule compiled against the project's
-`extension_api.json` (dumped from Godot 4.7.2).
+Output lands directly in `addons/godot_cm/bin/` (`.so` / `.dll`). The
+Windows build statically links the MinGW runtime, so separate MinGW runtime
+DLLs are not needed; Windows system libraries are still required. `godot-cpp/`
+is a submodule compiled against the project's `api/extension_api.json` (dumped
+from Godot 4.7.2).
