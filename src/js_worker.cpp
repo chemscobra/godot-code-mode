@@ -74,7 +74,7 @@ Dictionary error_result(const String &code, const String &message, const String 
 	return d;
 }
 
-Dictionary bounded_response(Dictionary out) {
+Dictionary bounded_response(Dictionary out, bool keep_empty_fields = false) {
 	PerfScope cost(PerfMetric::FINAL_RESPONSE_NS);
 	for (const char *field : {"diagnostics", "effects", "changes"}) {
 		if (out.get(field, Variant()).get_type() != Variant::ARRAY) continue;
@@ -93,7 +93,7 @@ Dictionary bounded_response(Dictionary out) {
 			if (omitted) { record["omitted_characters"] = omitted; out["truncated"] = true; }
 			records[i] = record;
 		}
-		if (records.is_empty()) out.erase(field); else out[field] = records;
+		if (records.is_empty() && !keep_empty_fields) out.erase(field); else out[field] = records;
 	}
 	auto fits = [&]() { return Performance::json(out).utf8().length() <= OUTPUT_LIMIT; };
 	if (fits()) return out;
@@ -1607,14 +1607,20 @@ godot.scene.stop = async function() {
 			out["effects"] = ec.tx->effects;
 		}
 		bool partial = req.mode == "untracked" && !(bool)out.get("ok", false) && !ec.tx->effects.is_empty();
-		if (partial) out["partial"] = true;
+		if (partial || ec.tx->verbose) out["partial"] = partial;
 		if (ec.tx->verbose) {
 			out["mode"] = req.mode.c_str();
 			out["rollback_supported"] = req.mode == "write";
 		}
 	}
-	if (!ec.checkpoints.is_empty()) {
+	if (!ec.checkpoints.is_empty() || (ec.tx && ec.tx->verbose)) {
 		out["checkpoints"] = ec.checkpoints;
+	}
+	bool verbose = ec.tx && ec.tx->verbose;
+	if (verbose) {
+		for (const char *field : {"diagnostics", "effects", "changes"}) {
+			if (!out.has(field)) out[field] = Array();
+		}
 	}
 	// Op warnings (e.g. MIXED_SPACE) surface as diagnostics; the op itself
 	// already applied — the agent decides whether to act on the hint.
@@ -1627,7 +1633,7 @@ godot.scene.stop = async function() {
 		}
 		out["diagnostics"] = diags;
 	}
-	return bounded_response(out);
+	return bounded_response(out, verbose);
 }
 
 } // namespace godot_cm

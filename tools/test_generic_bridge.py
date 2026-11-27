@@ -503,6 +503,7 @@ class Client:
         arguments = {"code": code}
         if name == "execute":
             arguments["mode"] = mode
+            arguments["verbose"] = True
         if timeout is not None:
             arguments["timeoutMs"] = timeout
         self.profile_labels.append(self.profile_label)

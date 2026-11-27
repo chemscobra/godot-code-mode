@@ -27,7 +27,7 @@ namespace godot_cm {
 
 static const char *PROTOCOL_VERSION = "2025-11-25";
 static const char *SERVER_NAME = "godot-cm";
-static const char *SERVER_VERSION = "0.3.1";
+static const char *SERVER_VERSION = "0.3.2";
 
 void McpService::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("register_plugin_method", "name", "provider", "definition"), &McpService::register_plugin_method);

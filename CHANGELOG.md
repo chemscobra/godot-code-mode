@@ -4,6 +4,23 @@ Release notes for the 0.3.x series. Earlier releases are available through the
 repository's Git tags. Versions below refer to the addon and MCP server, not
 the MCP protocol or Godot engine version.
 
+## 0.3.2
+
+### Compact responses and helper operations
+
+- `execute` responses are compact by default: empty `diagnostics`/`changes`/`effects` are omitted and writes are reported as grouped counts (`{"Node3D.set": 24}`) with `status: committed|rolled_back`. `verbose: true` restores the ordered per-op log; external effects remain visible in both modes.
+- `godot.build({type, name, props, children})` constructs whole subtrees in one transaction with automatic owner assignment. `godot.scene.new/reload/tree/run/stop` cover scene creation, reload, inspection and playback.
+- `godot.attachScript(node, 'res://x.gd')` assigns scripts through a trusted, undoable editor operation; `Script` and meta-methods stay denied.
+- `godot.permissions({class, member})` reports `allowed`, `reason` and `unlock` for every gate (denylist, tiers, restrict, meta-methods).
+
+### Permission-layer unblocks
+
+- `const`-flagged native methods count as reads in `read` mode instead of falling back to name-prefix heuristics.
+- Journaled inverses added for transform mutators, `show`/`hide`, `add_to_group`/`remove_from_group`, `move_child`, `add_sibling` and focus calls.
+- `EditorInterface` allowlist widened (`get_open_scenes`, `get_resource_filesystem`, `get_editor_paths`, `get_script_editor`, `get_selected_paths`); returned classes stay protected by their own tiers.
+- `set_x(v)` routes through the journaled `set` path so both spellings behave identically (fixes the `material_override` mismatch).
+- Packed arrays encode as tagged values with `values` preserving round-trip types; `StringName`/`NodePath` keep explicit tags.
+
 ## 0.3.1
 
 ### Performance

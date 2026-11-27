@@ -6,7 +6,7 @@ that awaits authorized editor operations. Supported edits can be grouped into
 one undoable editor action; an explicit `untracked` mode also permits calls
 whose effects cannot be rolled back.
 
-- Current addon version: **0.3.1** — [release notes](CHANGELOG.md)
+- Current addon version: **0.3.2** — [release notes](CHANGELOG.md)
 - Godot floor: **4.7** (validated on 4.7.2, linux-x86_64)
 - Platforms: Linux x86-64 tested; Windows x86-64 cross-built, runtime unverified.
 - MCP spec: **2025-11-25** (Streamable HTTP on loopback + stdio adapter)
@@ -29,7 +29,7 @@ your-project/
     ├── godot_cm.gdextension      # entry symbol + per-platform binaries
     ├── plugin.cfg / plugin.gd    # EditorPlugin that owns the service
     ├── bin/                    # native core (.so linux, .dll windows)
-    ├── tools/godot_cm_stdio.py # stdio adapter for MCP clients
+    ├── tools/godot_cm_stdio.*  # stdio adapter for MCP clients (Python 3 / Node.js)
     ├── allowlist.json            # permission config: denylist, tiers, policies
     ├── api-surface.d.ts          # generated declarations for the exposed API
     ├── extension_api.json        # 4.7.2 reference dump; discovery uses ClassDB
@@ -56,23 +56,70 @@ schema.
 ## Client configuration
 
 HTTP-capable clients can point at the loopback URL with the session token.
-For stdio-only clients use the adapter shipped inside the addon at
-`addons/godot_cm/tools/godot_cm_stdio.py`:
+For stdio-only clients use the adapter shipped inside the addon. Two
+equivalent implementations are provided — use whichever runtime the client
+machine already has (no external dependencies):
+
+- `addons/godot_cm/tools/godot_cm_stdio.py` (Python 3)
+- `addons/godot_cm/tools/godot_cm_stdio.js` (Node.js)
 
 **Claude Code**
 
 ```
 claude mcp add godot-cm -- python3 your-project/addons/godot_cm/tools/godot_cm_stdio.py
+# or:
+claude mcp add godot-cm -- node your-project/addons/godot_cm/tools/godot_cm_stdio.js
 ```
 
 **Codex / other stdio clients** — register an equivalent stdio command:
 
 ```
 python3 your-project/addons/godot_cm/tools/godot_cm_stdio.py
+# or:
+node your-project/addons/godot_cm/tools/godot_cm_stdio.js
 ```
 
+**Claude Desktop** — it only accepts stdio servers, so point it at the
+adapter. Edit `claude_desktop_config.json`
+(`%APPDATA%\Claude\` on Windows, `~/Library/Application Support/Claude/` on
+macOS):
+
+```json
+{
+  "mcpServers": {
+    "godot-cm": {
+      "command": "python3",
+      "args": ["C:/path/to/your-project/addons/godot_cm/tools/godot_cm_stdio.py"]
+    }
+  }
+}
+```
+
+Use `node` + `godot_cm_stdio.js` instead if the machine has Node but not
+Python. On Windows you can use `"command": "py"` when `python3` is not on
+PATH. Restart Claude Desktop after saving.
+
+**Cursor / VS Code / Windsurf** — these accept remote HTTP MCP servers.
+Register the editor endpoint directly, e.g. in `.cursor/mcp.json` or the
+client's MCP settings:
+
+```json
+{
+  "mcpServers": {
+    "godot-cm": { "url": "http://127.0.0.1:8765/mcp" }
+  }
+}
+```
+
+No adapter or token handling needed in that case — the client talks
+Streamable HTTP to the editor and gets the session id from the response
+headers.
+
 The adapter forwards stdin/stdout JSON-RPC to the HTTP endpoint, attaching
-the token it reads from the session file.
+the token it reads from the session file. It polls for the session file
+while the editor starts (`GODOT_CM_TOKEN_WAIT`, 20 s default), retries
+stale tokens from other projects, and accepts `GODOT_CM_PROJECT` to pin
+one project when several editors are open.
 
 ## Tools
 

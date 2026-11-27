@@ -14,6 +14,7 @@
 ## 3. Multi-genre dogfood
 
 - [ ] 3.1 Fixtures under `tools/fixtures/`: platformer (TileMapLayer + CharacterBody2D), UI (Control + theme), signals
+- [ ] 3.1a 3D baseline: replay `tools/fixtures/prompts/monument-valley-3d.md` (the v0.2.1 dogfood prompt) and compare calls/bytes vs the original ~17 KB effects invoice
 - [ ] 3.2 Per-genre scenario driver producing friction invoice: calls, blocks+reasons, response bytes
 - [ ] 3.3 Verify: expected denials explained; `NO_UNDO` gaps (set_cell, connect, …) reported; byte budgets hold
 

@@ -5,7 +5,9 @@ to the editor's Streamable HTTP endpoint.
 Token ownership (design D5): the adapter reads the session token from
 $GODOT_CM_TOKEN, $GODOT_CM_TOKEN_FILE, or the newest
 ~/.local/share/godot/app_userdata/*/godot_cm_session file the editor wrote.
-Never takes the token from argv.
+Never takes the token from argv. Env: GODOT_CM_PORT, GODOT_CM_TOKEN_WAIT
+(seconds to poll for the file while the editor starts), GODOT_CM_PROJECT
+(pin the session file to one project's app_userdata folder name).
 
 Usage as MCP server config:
   {"command": "python3", "args": ["/path/to/godot_cm_stdio.py"]}
@@ -13,12 +15,19 @@ Usage as MCP server config:
 import json
 import os
 import sys
+import time
 import urllib.request
 import urllib.error
 import glob
 
 PORT = int(os.environ.get("GODOT_CM_PORT", "8765"))
 URL = f"http://127.0.0.1:{PORT}/mcp"
+# The editor writes godot_cm_session when the service starts; the adapter may
+# be spawned while the project is still scanning, so poll briefly.
+TOKEN_WAIT = float(os.environ.get("GODOT_CM_TOKEN_WAIT", "20"))
+# Optional: pin the session file to one project (the app_userdata folder name,
+# i.e. the project's config/name) when several Godot editors are open.
+PROJECT = os.environ.get("GODOT_CM_PROJECT")
 
 
 def appdata_roots():
@@ -37,14 +46,26 @@ def find_token() -> str:
     token_file = os.environ.get("GODOT_CM_TOKEN_FILE")
     if token_file and os.path.exists(token_file):
         return open(token_file).read().strip()
+    deadline = time.monotonic() + TOKEN_WAIT
+    while True:
+        candidates = token_candidates()
+        if candidates:
+            newest = candidates[0]
+            return open(newest).read().strip()
+        if time.monotonic() >= deadline:
+            return ""
+        time.sleep(0.25)
+
+
+def token_candidates() -> list:
+    """Session files from all projects, newest first."""
     candidates = []
     for root in appdata_roots():
         candidates += glob.glob(
-            os.path.join(root, "app_userdata", "*", "godot_cm_session"))
-    if candidates:
-        newest = max(candidates, key=os.path.getmtime)
-        return open(newest).read().strip()
-    return ""
+            os.path.join(root, "app_userdata",
+                         PROJECT or "*", "godot_cm_session"))
+    candidates.sort(key=os.path.getmtime, reverse=True)
+    return candidates
 
 
 def post(payload: dict, session_id: str):
@@ -80,6 +101,14 @@ def main():
         except json.JSONDecodeError:
             continue
         status, data, session_id = post(payload, session_id)
+        if b"-32001" in data:
+            # Stale token — the newest session file may belong to another
+            # project. Walk candidates newest-first until one is accepted.
+            for candidate in token_candidates():
+                session_id = open(candidate).read().strip()
+                status, data, session_id = post(payload, session_id)
+                if b"-32001" not in data:
+                    break
         if status in (202, 204) or not data:
             continue  # notifications have no response body
         out.write(data.decode(errors="replace") + "\n")

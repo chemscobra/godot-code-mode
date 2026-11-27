@@ -41,6 +41,7 @@ declare namespace api {
 		properties: (GodotTypeDescriptor & { name: string; read_mode: string; write_mode: string })[];
 	} | undefined;
 	function find(query: string): string[];
+	function example(type: string): unknown; // wire literal accepted by godot.set/call for that Variant type
 }
 
 declare interface GodotClass_AStar2D {
@@ -100342,12 +100343,15 @@ declare interface GodotClass_EditorInspectorVisualShaderModePlugin {
 }
 
 declare interface GodotClass_EditorInterface {
+	"get_resource_filesystem"(): GodotHandle;
+	"get_editor_paths"(): GodotHandle;
 	"get_resource_previewer"(): GodotHandle;
 	"get_selection"(): GodotHandle;
 	"get_editor_toaster"(): GodotHandle;
 	"get_editor_undo_redo"(): GodotHandle;
 	"get_base_control"(): GodotHandle;
 	"get_editor_main_screen"(): GodotHandle;
+	"get_script_editor"(): GodotHandle;
 	"get_editor_viewport_2d"(): GodotHandle;
 	"get_editor_viewport_3d"(arg0?: GodotInt): GodotHandle;
 	"set_main_screen_editor"(arg0: string): void;
@@ -100356,6 +100360,7 @@ declare interface GodotClass_EditorInterface {
 	"popup_node_selector"(arg0: GodotValueReference<"Callable">, arg1?: GodotArray, arg2?: GodotHandle): void;
 	"popup_create_dialog"(arg0: GodotValueReference<"Callable">, arg1?: string | { $t: "StringName"; value: string }, arg2?: string, arg3?: string, arg4?: GodotArray): void;
 	"select_file"(arg0: string): void;
+	"get_selected_paths"(): GodotPacked<"PackedStringArray">;
 	"get_current_path"(): string;
 	"get_current_directory"(): string;
 	"get_inspector"(): GodotHandle;
@@ -100364,6 +100369,7 @@ declare interface GodotClass_EditorInterface {
 	"edit_node"(arg0: GodotHandle): void;
 	"open_scene_from_path"(arg0: string, arg1?: boolean): void;
 	"reload_scene_from_path"(arg0: string): void;
+	"get_open_scenes"(): GodotPacked<"PackedStringArray">;
 	"get_open_scene_roots"(): GodotArray;
 	"get_edited_scene_root"(): GodotHandle;
 	"save_scene"(): GodotInt;
@@ -352675,6 +352681,8 @@ declare interface GodotClass_GenericMcpWidget {
 	"large_strings"(arg0: GodotInt): GodotPacked<"PackedStringArray">;
 	"large_bytes"(arg0: GodotInt): GodotPacked<"PackedByteArray">;
 	"large_item"(): GodotArray;
+	"page_rejection"(): GodotArray;
+	"page_retention_pair"(): GodotArray;
 	"native_cycle"(): GodotArray;
 	"clear_cycle"(arg0: GodotArray): void;
 	"echo_typed_array"(arg0: GodotArray): GodotArray;
@@ -352684,6 +352692,21 @@ declare interface GodotClass_GenericMcpWidget {
 	"default_vector"(arg0?: GodotVector3 | GodotValueReference<"Vector3">): GodotVector3 | GodotValueReference<"Vector3">;
 	"default_callable"(arg0?: GodotValueReference<"Callable">): boolean;
 	"page_strings"(arg0: GodotPacked<"PackedStringArray">, arg1: GodotInt, arg2: GodotInt): GodotArray;
+	"script_identity"(arg0: GodotHandle): GodotInt;
+	"replace_script_source"(arg0: GodotHandle, arg1: string): void;
+	"reload_script"(arg0: GodotHandle): GodotInt;
+	"reload_native"(arg0: string): GodotInt;
+	"destroy_node"(arg0: GodotHandle): void;
+	"set_test_policy"(arg0: string, arg1: string): void;
+	"scan_scripts"(): void;
+	"update_script"(arg0: string): void;
+	"scan_busy"(): boolean;
+	"registered_script"(arg0: string): boolean;
+	"unicode_strings"(arg0: GodotInt, arg1: GodotInt): GodotPacked<"PackedStringArray">;
+	"unicode_dictionary"(arg0: GodotInt, arg1: GodotInt): GodotDictionary;
+	"page_size_oracle"(arg0: any, arg1: GodotInt, arg2: GodotInt): GodotDictionary;
+	"benchmark_sleep"(arg0: GodotInt): GodotInt;
+	"large_dictionary"(arg0: GodotInt): GodotDictionary;
 	"set_transform"(arg0: GodotTransform3D | GodotValueReference<"Transform3D">): void;
 	"get_transform"(): GodotTransform3D | GodotValueReference<"Transform3D">;
 	"set_position"(arg0: GodotVector3 | GodotValueReference<"Vector3">): void;
@@ -353336,10 +353359,26 @@ declare namespace godot {
 	function unlockWrites(): Promise<{ was_locked: boolean }>;
 	function requestTier(tier: string): Promise<{ granted: boolean; tier: string; already_unlocked?: boolean }>;
 	function unlockedTiers(): Promise<string[]>;
+	function attachScript(node: GodotHandle, path: string): Promise<unknown>;
+	function permissions(query?: { class?: string; member?: string }): Promise<unknown>;
+	function build(tree: { type: string; name?: string; props?: Record<string, unknown>; children?: unknown[] }, options?: { parent?: GodotHandle }): Promise<GodotHandle>;
+	namespace scene {
+		function new(path: string, options?: { type?: string; name?: string }): Promise<GodotHandle>;
+		function reload(path?: string): Promise<GodotHandle>;
+		function tree(options?: { root?: GodotHandle; depth?: number; maxNodes?: number }): Promise<unknown>;
+		function run(): Promise<{ playing: boolean; scene?: string; console?: string }>;
+		function stop(): Promise<{ playing: boolean }>;
+	}
 	function batch(ops: {
 		op: string; target?: GodotHandle; member?: string; prop?: string;
 		method?: string; class?: string; args?: any[]; value?: any;
 	}[]): Promise<{ ok: boolean; result?: any; error?: { code: string; message: string } }[]>;
+	function loadResource(path: string): Promise<GodotHandle>;
+	function instantiateScene(packedScene: GodotHandle): Promise<GodotHandle>;
+	function discoverPlugins(): Promise<unknown>;
+	function pluginRead(name: string, args?: Record<string, unknown>): Promise<unknown>;
+	function pluginCall(name: string, args?: Record<string, unknown>): Promise<unknown>;
+	function pluginAction(name: string, args?: Record<string, unknown>): Promise<unknown>;
 	namespace editor {
 		function getEditedScene(): Promise<GodotHandle>;
 	}
