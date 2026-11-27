@@ -3,11 +3,14 @@
 #include "api_index.hpp"
 #include "bridge.hpp"
 #include "js_worker.hpp"
+#include "performance.hpp"
 
 #include <random>
 #include <thread>
 
 #include <godot_cpp/classes/engine.hpp>
+#include <godot_cpp/classes/editor_file_system.hpp>
+#include <godot_cpp/classes/editor_interface.hpp>
 #include <godot_cpp/classes/gd_extension_manager.hpp>
 #include <godot_cpp/classes/file_access.hpp>
 #include <godot_cpp/classes/json.hpp>
@@ -24,7 +27,7 @@ namespace godot_cm {
 
 static const char *PROTOCOL_VERSION = "2025-11-25";
 static const char *SERVER_NAME = "godot-cm";
-static const char *SERVER_VERSION = "0.3.0";
+static const char *SERVER_VERSION = "0.3.1";
 
 void McpService::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("start", "port"), &McpService::start);
@@ -350,6 +353,8 @@ Variant McpService::dispatch_rpc(const Dictionary &request) {
 }
 
 bool McpService::start(int p_port) {
+	PerfReport profile("startup");
+	PerfScope startup_cost(PerfMetric::STARTUP_NS);
 	if (running.load()) {
 		return true;
 	}
@@ -391,7 +396,12 @@ bool McpService::start(int p_port) {
 		pump.instantiate();
 		pump->bridge = bridge.get();
 		tree->connect("process_frame", Callable(pump.ptr(), "pump"));
-		GDExtensionManager::get_singleton()->connect("extensions_reloaded", Callable(pump.ptr(), "invalidate_catalog"));
+		GDExtensionManager *extensions = GDExtensionManager::get_singleton();
+		extensions->connect("extensions_reloaded", Callable(pump.ptr(), "invalidate_catalog"));
+		for (const char *signal : {"extension_loaded", "extension_unloading"}) extensions->connect(signal, Callable(pump.ptr(), "invalidate_catalog").unbind(1));
+		EditorInterface *editor = EditorInterface::get_singleton();
+		EditorFileSystem *filesystem = editor ? editor->get_resource_filesystem() : nullptr;
+		if (filesystem) for (const char *signal : {"filesystem_changed", "script_classes_updated"}) filesystem->connect(signal, Callable(pump.ptr(), "invalidate_scripts"));
 	} else {
 		UtilityFunctions::printerr("[godot-cm] no SceneTree; bridge disabled");
 	}
@@ -502,6 +512,11 @@ void McpService::stop() {
 		GDExtensionManager *extensions = GDExtensionManager::get_singleton();
 		Callable refresh(pump.ptr(), "invalidate_catalog");
 		if (extensions && extensions->is_connected("extensions_reloaded", refresh)) extensions->disconnect("extensions_reloaded", refresh);
+		for (const char *signal : {"extension_loaded", "extension_unloading"}) if (extensions && extensions->is_connected(signal, refresh.unbind(1))) extensions->disconnect(signal, refresh.unbind(1));
+		EditorInterface *editor = EditorInterface::get_singleton();
+		EditorFileSystem *filesystem = editor ? editor->get_resource_filesystem() : nullptr;
+		Callable scripts(pump.ptr(), "invalidate_scripts");
+		if (filesystem) for (const char *signal : {"filesystem_changed", "script_classes_updated"}) if (filesystem->is_connected(signal, scripts)) filesystem->disconnect(signal, scripts);
 		pump.unref();
 	}
 	if (bridge) {

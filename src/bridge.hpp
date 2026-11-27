@@ -65,6 +65,7 @@ struct PendingBridge {
 	BridgeOp op;
 	BridgeResult result;
 	std::atomic<bool> done{false};
+	uint64_t queued_ns = 0;
 	std::shared_ptr<std::atomic<bool>> cancel; // shared request flag
 	std::shared_ptr<TxState> tx;               // per-request transaction
 };
@@ -143,6 +144,7 @@ public:
 	Bridge *bridge = nullptr;
 	uint64_t last_catalog_refresh = 0;
 	void invalidate_catalog();
+	void invalidate_scripts();
 	void pump();
 };
 

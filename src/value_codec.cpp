@@ -1,4 +1,5 @@
 #include "value_codec.hpp"
+#include "performance.hpp"
 
 #include <godot_cpp/classes/object.hpp>
 #include <godot_cpp/classes/json.hpp>
@@ -451,7 +452,7 @@ Variant ValueCodec::encode(const Variant &value, String path, int depth) {
 		}
 		uint64_t checkpoint = retention_checkpoint ? retention_checkpoint() : 0;
 		auto bounded = [&](const Variant &encoded) -> Variant {
-			if (JSON::stringify(encoded).utf8().length() <= INLINE_BYTES) return encoded;
+			if (Performance::json(encoded).utf8().length() <= INLINE_BYTES) return encoded;
 			if (rollback_retention) rollback_retention(checkpoint);
 			if (retain) return retain(value);
 			fail("OUTPUT_LIMIT", "encoded collection exceeds inline byte budget", path);

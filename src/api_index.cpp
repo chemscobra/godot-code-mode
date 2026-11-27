@@ -1,5 +1,6 @@
 #include "api_index.hpp"
 #include "value_codec.hpp"
+#include "performance.hpp"
 
 #include <godot_cpp/classes/file_access.hpp>
 #include <godot_cpp/classes/json.hpp>
@@ -15,6 +16,9 @@
 using namespace godot;
 
 namespace godot_cm {
+
+ApiCatalog::ApiCatalog(const Dictionary &data) : index(data) { Performance::catalog_created(); }
+ApiCatalog::~ApiCatalog() { Performance::catalog_destroyed(); }
 
 static Variant parse_json_file(const String &path) {
 	Ref<FileAccess> f = FileAccess::open(path, FileAccess::READ);
@@ -129,11 +133,68 @@ static Dictionary reflected_method(const Dictionary &raw) {
 	return result;
 }
 
-void ApiIndex::observe_script(Object *object) {
+Dictionary ApiIndex::inspect_script(Object *object) {
+	Script *script = Object::cast_to<Script>(object);
+	if (!script || !script->get_path().begins_with("res://")) return Dictionary();
+	Performance::add(PerfMetric::SCRIPT_REFLECTIONS);
+	String path = script->get_path(), global_name = script->get_global_name();
+	Ref<Script> base = script->get_base_script();
+	String base_name = base.is_valid() ? String(base->get_global_name()) : String();
+	Array raw_methods = script->get_script_method_list(), raw_properties = script->get_script_property_list();
+	Dictionary stamp;
+	stamp["identity"] = (int64_t)script->get_instance_id();
+	stamp["class"] = global_name;
+	stamp["base"] = base.is_valid() ? base_name.is_empty() ? "script:" + base->get_path() : base_name : String(script->get_instance_base_type());
+	Array method_stamps, defaults;
+	for (const Variant &method : raw_methods) {
+		Dictionary raw = ((Dictionary)method).duplicate();
+		Array values = raw.get("default_args", Array());
+		raw.erase("default_args");
+		method_stamps.push_back(plain_metadata(raw));
+		Array encoded;
+		for (const Variant &value : values) {
+			try { encoded.push_back(ValueCodec().encode(value)); }
+			catch (const ValueFailure &) { encoded.push_back(Variant()); }
+		}
+		defaults.push_back(encoded);
+	}
+	stamp["methods"] = method_stamps;
+	stamp["properties"] = plain_metadata(raw_properties);
+	stamp["defaults"] = defaults;
+	if (script_descriptors.has(path)) {
+		Dictionary cached = script_descriptors[path];
+		if (Variant(cached["stamp"]) == Variant(stamp)) {
+			Performance::add(PerfMetric::CACHE_HITS);
+			return cached["info"];
+		}
+	}
+	Performance::add(PerfMetric::CACHE_MISSES);
+	Dictionary info;
+	info["class"] = global_name.is_empty() ? "script:" + path : global_name;
+	info["path"] = path;
+	info["base"] = stamp["base"];
+	Array methods, properties;
+	for (const Variant &method : raw_methods) methods.push_back(reflected_method(method));
+	for (const Variant &property : raw_properties) properties.push_back(reflected_type(property));
+	info["methods"] = methods;
+	info["properties"] = properties;
+	Dictionary cached;
+	cached["stamp"] = stamp;
+	cached["info"] = info;
+	script_descriptors[path] = cached;
+	Performance::set(PerfMetric::SCRIPT_CACHE_ENTRIES, script_descriptors.size());
+	dirty = true;
+	return info;
+}
+
+void ApiIndex::observe_script(Object *object, bool inspect) {
 	if (!object) return;
 	Ref<Script> script = Object::cast_to<Script>(object) ? Ref<Script>(Object::cast_to<Script>(object)) : Ref<Script>(object->get_script());
 	for (int depth = 0; script.is_valid() && depth < 64; depth++, script = script->get_base_script()) {
-		if (script->get_path().begins_with("res://")) observed_scripts[script->get_path()] = true;
+		String path = script->get_path();
+		if (!path.begins_with("res://")) continue;
+		if (!observed_scripts.has(path)) { observed_scripts[path] = true; dirty = true; }
+		if (inspect) inspect_script(script.ptr());
 	}
 }
 
@@ -161,7 +222,26 @@ bool ApiIndex::load(const String &allowlist_path) {
 	return refresh();
 }
 
-bool ApiIndex::refresh() {
+void ApiIndex::invalidate(bool native) {
+	dirty = true;
+	native_dirty = native_dirty || native;
+	if (!native) {
+		script_descriptors.clear();
+		Performance::set(PerfMetric::SCRIPT_CACHE_ENTRIES, 0);
+	}
+}
+
+bool ApiIndex::refresh(bool reconcile) {
+	PerfScope cost(PerfMetric::CATALOG_NS);
+	Performance::add(PerfMetric::REFRESH_CALLS);
+	if (loaded && !dirty && !reconcile) {
+		Performance::add(PerfMetric::CACHE_HITS);
+		return true;
+	}
+	Performance::add(PerfMetric::GLOBAL_DISCOVERY);
+	for (const Variant &path : script_descriptors.keys()) if (!ResourceLoader::get_singleton()->has_cached(path)) { script_descriptors.erase(path); dirty = true; }
+	for (const Variant &path : observed_scripts.keys()) if (!ResourceLoader::get_singleton()->has_cached(path)) { observed_scripts.erase(path); dirty = true; }
+	Performance::set(PerfMetric::SCRIPT_CACHE_ENTRIES, script_descriptors.size());
 	ClassDBSingleton *cdb = ClassDBSingleton::get_singleton();
 	PackedStringArray native_names = cdb->get_class_list();
 	EditorInterface *editor = EditorInterface::get_singleton();
@@ -169,7 +249,8 @@ bool ApiIndex::refresh() {
 	for (int i = 0; i < pending.size() && i < 4096; i++) {
 		Node *node = Object::cast_to<Node>((Object *)pending[i]);
 		if (!node) continue;
-		observe_script(node);
+		Performance::add(PerfMetric::SCENE_NODES);
+		observe_script(node, false);
 		pending.append_array(node->get_children());
 	}
 	Array scripts = ProjectSettings::get_singleton()->get_global_class_list();
@@ -188,31 +269,14 @@ bool ApiIndex::refresh() {
 		if (ResourceLoader::get_singleton()->has_cached(path)) {
 			Ref<Script> script(ResourceLoader::get_singleton()->get_cached_ref(path));
 			if (script.is_valid()) {
-				observe_script(script.ptr());
-				String global_name = script->get_global_name();
-				info["class"] = global_name.is_empty() ? "script:" + path : global_name;
-				Ref<Script> base = script->get_base_script();
-				String base_name = base.is_valid() ? String(base->get_global_name()) : String();
-				info["base"] = base.is_valid() ? base_name.is_empty() ? "script:" + base->get_path() : base_name : String(script->get_instance_base_type());
-				Array methods;
-				for (const Variant &method : script->get_script_method_list()) methods.push_back(reflected_method(method));
-				Array properties;
-				for (const Variant &property : script->get_script_property_list()) properties.push_back(reflected_type(property));
-				info["methods"] = methods;
-				info["properties"] = properties;
+				observe_script(script.ptr(), false);
+				Dictionary reflected = inspect_script(script.ptr());
+				for (const Variant &key : reflected.keys()) info[key] = reflected[key];
 			}
 		}
 		scripts[i] = info;
 	}
 	PackedStringArray singleton_names = Engine::get_singleton()->get_singleton_list();
-	uint64_t next_revision = (((uint64_t)Variant(native_names).hash() << 32) ^ scripts.hash()) + Variant(singleton_names).hash();
-	if (loaded && !dirty && next_revision == revision) return true;
-	dirty = false;
-	Dictionary cfg = policy_document;
-	bool deny_mode = String(cfg.get("mode", "")) == "denylist";
-	Dictionary allow = cfg.get("classes", Dictionary());
-	// EditorInterface etc. live under "singletons" or "classes" depending on the dump.
-	Array all;
 	Dictionary aliases;
 	for (const String &name : singleton_names) {
 		Object *object = Engine::get_singleton()->get_singleton(name);
@@ -225,57 +289,76 @@ bool ApiIndex::refresh() {
 	Array editor_alias;
 	editor_alias.push_back("EditorInterface");
 	aliases["EditorInterface"] = editor_alias;
-	Dictionary declared_methods;
-	Dictionary method_flags;
-	auto methods_for = [&](const String &name) -> Array {
-		if (!declared_methods.has(name)) {
-			Array methods = cdb->class_get_method_list(name, true);
-			Dictionary flags;
-			for (const Variant &method : methods) {
-				Dictionary info = method;
-				flags[info.get("name", "")] = info.get("flags", 0);
-			}
-			declared_methods[name] = methods;
-			method_flags[name] = flags;
-		}
-		return declared_methods[name];
-	};
-	for (const String &name : native_names) {
-		Dictionary cls;
-		cls["name"] = name;
-		cls["inherits"] = cdb->get_parent_class(name);
-		cls["kind"] = "native_class";
-		cls["singletons"] = aliases.get(name, Array());
-		auto api_type = cdb->class_get_api_type(name);
-		cls["source"] = api_type == ClassDBSingleton::API_EXTENSION || api_type == ClassDBSingleton::API_EDITOR_EXTENSION ? "extension" : "engine";
-		Array methods;
-		for (const Variant &method : methods_for(name)) methods.push_back(reflected_method(method));
-		cls["methods"] = methods;
-		Array properties;
-		for (const Variant &property : cdb->class_get_property_list(name, true)) {
-			Dictionary raw = property;
-			if ((int)raw.get("usage", 0) & (PROPERTY_USAGE_GROUP | PROPERTY_USAGE_CATEGORY | PROPERTY_USAGE_SUBGROUP)) continue;
-			Dictionary property_info = reflected_type(raw);
-			String getter = cdb->class_get_property_getter(name, raw.get("name", ""));
-			property_info["is_const"] = false;
-			String owner = name;
-			for (int guard = 0; !getter.is_empty() && !owner.is_empty() && guard < 64; guard++) {
-				methods_for(owner);
-				Dictionary flags = method_flags[owner];
-				if (flags.has(getter)) {
-					property_info["is_const"] = bool((int)flags[getter] & METHOD_FLAG_CONST);
-					break;
-				}
-				owner = cdb->get_parent_class(owner);
-			}
-			properties.push_back(property_info);
-		}
-		cls["properties"] = properties;
-		Dictionary constants;
-		for (const String &key : cdb->class_get_integer_constant_list(name)) constants[key] = cdb->class_get_integer_constant(name, key);
-		cls["constants"] = constants;
-		all.push_back(cls);
+	if (Variant(native_names) != cached_native_names || Variant(aliases) != cached_singletons) dirty = true;
+	uint64_t next_revision = (((uint64_t)Variant(native_names).hash() << 32) ^ scripts.hash()) + Variant(singleton_names).hash();
+	if (loaded && !dirty && next_revision == revision && Variant(scripts) == cached_scripts) {
+		Performance::add(PerfMetric::CACHE_HITS);
+		return true;
 	}
+	Performance::add(PerfMetric::CACHE_MISSES);
+	dirty = false;
+	Dictionary cfg = policy_document;
+	bool deny_mode = String(cfg.get("mode", "")) == "denylist";
+	Dictionary allow = cfg.get("classes", Dictionary());
+	// EditorInterface etc. live under "singletons" or "classes" depending on the dump.
+	Array all;
+	if (native_dirty || Variant(native_names) != cached_native_names || Variant(aliases) != cached_singletons) {
+		Dictionary declared_methods;
+		Dictionary method_flags;
+		auto methods_for = [&](const String &name) -> Array {
+			if (!declared_methods.has(name)) {
+				Array methods = cdb->class_get_method_list(name, true);
+				Dictionary flags;
+				for (const Variant &method : methods) {
+					Dictionary info = method;
+					flags[info.get("name", "")] = info.get("flags", 0);
+				}
+				declared_methods[name] = methods;
+				method_flags[name] = flags;
+			}
+			return declared_methods[name];
+		};
+		for (const String &name : native_names) {
+			Dictionary cls;
+			cls["name"] = name;
+			cls["inherits"] = cdb->get_parent_class(name);
+			cls["kind"] = "native_class";
+			cls["singletons"] = aliases.get(name, Array());
+			auto api_type = cdb->class_get_api_type(name);
+			cls["source"] = api_type == ClassDBSingleton::API_EXTENSION || api_type == ClassDBSingleton::API_EDITOR_EXTENSION ? "extension" : "engine";
+			Array methods;
+			for (const Variant &method : methods_for(name)) methods.push_back(reflected_method(method));
+			cls["methods"] = methods;
+			Array properties;
+			for (const Variant &property : cdb->class_get_property_list(name, true)) {
+				Dictionary raw = property;
+				if ((int)raw.get("usage", 0) & (PROPERTY_USAGE_GROUP | PROPERTY_USAGE_CATEGORY | PROPERTY_USAGE_SUBGROUP)) continue;
+				Dictionary property_info = reflected_type(raw);
+				String getter = cdb->class_get_property_getter(name, raw.get("name", ""));
+				property_info["is_const"] = false;
+				String owner = name;
+				for (int guard = 0; !getter.is_empty() && !owner.is_empty() && guard < 64; guard++) {
+					methods_for(owner);
+					Dictionary flags = method_flags[owner];
+					if (flags.has(getter)) {
+						property_info["is_const"] = bool((int)flags[getter] & METHOD_FLAG_CONST);
+						break;
+					}
+					owner = cdb->get_parent_class(owner);
+				}
+				properties.push_back(property_info);
+			}
+			cls["properties"] = properties;
+			Dictionary constants;
+			for (const String &key : cdb->class_get_integer_constant_list(name)) constants[key] = cdb->class_get_integer_constant(name, key);
+			cls["constants"] = constants;
+			all.push_back(cls);
+		}
+		native_descriptors = all.duplicate();
+		cached_native_names = native_names;
+		cached_singletons = aliases;
+		native_dirty = false;
+	} else all = native_descriptors.duplicate();
 	for (const Variant &item : scripts) {
 		Dictionary info = item;
 		Dictionary cls = info.duplicate();
@@ -509,11 +592,27 @@ bool ApiIndex::refresh() {
 		}
 		index[name] = entry;
 	}
+	method_descriptors = Dictionary();
+	property_descriptors = Dictionary();
+	for (const Variant &name : index.keys()) {
+		Dictionary entry = index[name];
+		for (const char *kind : {"methods", "properties"}) {
+			Dictionary resolved;
+			for (const Variant &item : (Array)entry[kind]) {
+				Dictionary member = item;
+				Variant key = member["name"];
+				if (!resolved.has(key)) resolved[key] = member;
+			}
+			(kind[0] == 'm' ? method_descriptors : property_descriptors)[name] = resolved;
+		}
+	}
 	loaded = true;
 	revision = next_revision;
+	cached_scripts = scripts;
 	{
 		std::lock_guard<std::mutex> lock(catalog_mutex);
 		catalog = std::make_shared<ApiCatalog>(index);
+		Performance::add(PerfMetric::CATALOG_PUBLICATIONS);
 	}
 	UtilityFunctions::print("[godot-cm] api index loaded: ", index.size(), " classes");
 	return true;
@@ -778,13 +877,9 @@ bool ApiIndex::class_allowed(const String &class_name) const {
 }
 
 Dictionary ApiIndex::member_info(const String &class_name, const String &member, bool property) const {
-	if (!index.has(class_name)) return Dictionary();
-	Array members = ((Dictionary)index[class_name]).get(property ? "properties" : "methods", Array());
-	for (const Variant &item : members) {
-		Dictionary info = item;
-		if (String(info.get("name", "")) == member) return info;
-	}
-	return Dictionary();
+	const Dictionary &descriptors = property ? property_descriptors : method_descriptors;
+	if (!descriptors.has(class_name)) return Dictionary();
+	return ((Dictionary)descriptors[class_name]).get(member, Dictionary());
 }
 
 bool ApiIndex::method_reversible(const String &class_name, const String &method) const {
@@ -797,46 +892,16 @@ bool ApiIndex::property_reversible(const String &class_name, const String &prope
 }
 
 bool ApiIndex::method_is_const(const String &class_name, const String &method) const {
-	if (!index.has(class_name)) return false;
-	Array methods = ((Dictionary)index[class_name]).get("methods", Array());
-	for (const Variant &item : methods) {
-		Dictionary info = item;
-		if (String(info.get("name", "")) == method) return (bool)info.get("is_const", false) && !(bool)info.get("script", false);
-	}
-	return false;
+	Dictionary info = member_info(class_name, method);
+	return (bool)info.get("is_const", false) && !(bool)info.get("script", false);
 }
 
 bool ApiIndex::member_declared(const String &class_name, const String &member) const {
-	if (!index.has(class_name)) return false;
-	Dictionary entry = index[class_name];
-	for (const char *key : {"methods", "properties"}) {
-		Array members = entry.get(key, Array());
-		for (const Variant &item : members) {
-			Dictionary info = item;
-			if (String(info.get("name", "")) == member && (bool)info.get("script", false)) return true;
-		}
-	}
-	return false;
+	return (bool)member_info(class_name, member).get("script", false) || (bool)member_info(class_name, member, true).get("script", false);
 }
 
 bool ApiIndex::member_allowed(const String &class_name, const String &member) const {
-	if (!class_allowed(class_name)) {
-		return false;
-	}
-	Dictionary e = index[class_name];
-	Array ms = e.get("methods", Array());
-	for (int i = 0; i < ms.size(); i++) {
-		if (String(((Dictionary)ms[i]).get("name", "")) == member) {
-			return true;
-		}
-	}
-	Array ps = e.get("properties", Array());
-	for (int i = 0; i < ps.size(); i++) {
-		if (String(((Dictionary)ps[i]).get("name", "")) == member) {
-			return true;
-		}
-	}
-	return false;
+	return class_allowed(class_name) && (!member_info(class_name, member).is_empty() || !member_info(class_name, member, true).is_empty());
 }
 
 } // namespace godot_cm

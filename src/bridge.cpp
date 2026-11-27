@@ -3,6 +3,7 @@
 
 #include "api_index.hpp"
 #include "value_codec.hpp"
+#include "performance.hpp"
 
 #include <godot_cpp/classes/class_db_singleton.hpp>
 #include <godot_cpp/classes/editor_interface.hpp>
@@ -25,19 +26,35 @@ namespace godot_cm {
 void BridgePump::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("pump"), &BridgePump::pump);
 	ClassDB::bind_method(D_METHOD("invalidate_catalog"), &BridgePump::invalidate_catalog);
+	ClassDB::bind_method(D_METHOD("invalidate_scripts"), &BridgePump::invalidate_scripts);
 }
 
 void BridgePump::invalidate_catalog() {
 	if (bridge && bridge->index) bridge->index->invalidate();
 }
 
+void BridgePump::invalidate_scripts() {
+	if (bridge && bridge->index) bridge->index->invalidate(false);
+}
+
 void BridgePump::pump() {
+	PerfScope cost(PerfMetric::PUMP_NS);
 	if (bridge) {
 		bridge->drain();
 		uint64_t now = Time::get_singleton()->get_ticks_msec();
 		if (bridge->index && now - last_catalog_refresh >= 100) {
-			bridge->index->refresh();
+			PerfScope maintenance(PerfMetric::MAINTENANCE_NS);
+			PerfMaintenance source;
+			bridge->index->refresh(true);
 			last_catalog_refresh = now;
+		}
+		cost.stop();
+		if (Performance::enabled()) {
+			static uint64_t last_report = 0;
+			if (now - last_report >= 1000) {
+				Performance::report("cumulative", Performance::Snapshot{});
+				last_report = now;
+			}
 		}
 	}
 }
@@ -87,6 +104,7 @@ std::shared_ptr<PendingBridge> Bridge::enqueue(const BridgeOp &op_in,
 		std::shared_ptr<std::atomic<bool>> cancel,
 		std::shared_ptr<TxState> tx) {
 	auto pb = std::make_shared<PendingBridge>();
+	pb->queued_ns = Performance::enabled() ? Performance::now() : 0;
 	pb->op = op_in;
 	pb->op.id = next_op++;
 	pb->cancel = cancel;
@@ -112,6 +130,7 @@ static BridgeResult op_value(const Variant &v) {
 }
 
 static BridgeResult invoke_checked(Object *target, const StringName &method, const Array &args) {
+	PerfScope cost(PerfMetric::NATIVE_NS);
 	std::vector<const Variant *> pointers;
 	for (int i = 0; i < args.size(); i++) pointers.push_back(&args[i]);
 	Variant receiver(target), value;
@@ -126,6 +145,7 @@ static BridgeResult invoke_checked(Object *target, const StringName &method, con
 // Convert a Variant result into wire form: objects become handle dicts,
 // arrays and dictionaries are converted recursively.
 Variant Bridge::to_wire(const Variant &v) {
+	PerfScope cost(PerfMetric::ENCODE_NS);
 	uint64_t checkpoint = next_value;
 	try { return make_codec().encode(v); }
 	catch (...) { rollback_values(checkpoint); throw; }
@@ -138,6 +158,7 @@ void Bridge::rollback_values(uint64_t checkpoint) {
 		retained_value_bytes -= value_sizes[entry->first];
 		value_sizes.erase(entry->first);
 		entry = values.erase(entry);
+		Performance::add(PerfMetric::VALUE_RELEASES);
 	}
 }
 
@@ -148,6 +169,7 @@ Variant Bridge::retain_value(const Variant &value) {
 	values[id] = value;
 	value_sizes[id] = bytes;
 	retained_value_bytes += bytes;
+	Performance::add(PerfMetric::VALUE_RETAINS);
 	Dictionary result;
 	result["__godotValue"] = reference_name(id, "v");
 	result["type"] = Variant::get_type_name(value.get_type());
@@ -238,6 +260,7 @@ BridgeResult Bridge::value_operation(const BridgeOp &op) {
 		retained_value_bytes -= value_sizes[id];
 		value_sizes.erase(id);
 		values.erase(id);
+		Performance::add(PerfMetric::VALUE_RELEASES);
 		Dictionary result; result["released"] = true;
 		return op_value(result);
 	}
@@ -263,6 +286,7 @@ BridgeResult Bridge::value_operation(const BridgeOp &op) {
 		return op_value(result);
 	}
 	if (!collection && !text && fields.empty()) return op_error("UNSUPPORTED_VALUE_OPERATION", "value supports passive metadata only");
+	PerfScope page_cost(PerfMetric::PAGE_NS);
 	Dictionary options;
 	if (op.args.size() > 1) {
 		if (op.args[1].get_type() != Variant::DICTIONARY) ValueCodec::fail("INVALID_VALUE_RANGE", "expected range options", "options");
@@ -276,9 +300,15 @@ BridgeResult Bridge::value_operation(const BridgeOp &op) {
 	result["total"] = size;
 	Array items;
 	Dictionary named;
+	String page_key = dictionary ? "entries" : fields.empty() ? "items" : "fields";
+	result[page_key] = fields.empty() ? Variant(items) : Variant(named);
+	int64_t prefix_bytes = Performance::json(result).utf8().length();
 	Variant cursor;
 	bool valid = false, more = dictionary ? value.iter_init(cursor, valid) : false;
-	if (dictionary) for (int64_t i = 0; i < offset && more; i++) more = value.iter_next(cursor, valid);
+	if (dictionary) {
+		PerfScope skip_cost(PerfMetric::DICTIONARY_SKIP_NS);
+		for (int64_t i = 0; i < offset && more; i++) more = value.iter_next(cursor, valid);
+	}
 	int64_t count = 0;
 	for (int64_t i = offset; i < size && count < limit; i++) {
 		uint64_t checkpoint = next_value;
@@ -293,29 +323,34 @@ BridgeResult Bridge::value_operation(const BridgeOp &op) {
 		else if (collection) { bool oob = false; item = value.get_indexed(i, valid, oob); }
 		else { field_name = fields[i].name; item = value.get_named(field_name, valid); }
 		if (!dictionary) encoded = to_wire(item);
-		if (JSON::stringify(encoded).utf8().length() > ValueCodec::INLINE_BYTES - 512) {
+		int64_t encoded_bytes = Performance::json(encoded).utf8().length();
+		if (encoded_bytes > ValueCodec::INLINE_BYTES - 512) {
 			rollback_values(checkpoint);
 			if (dictionary) {
 				Variant key = value.iter_get(cursor, valid);
 				Dictionary entry; entry["key"] = ValueCodec::estimate(key) > 1024 ? retain_value(key) : to_wire(key); entry["value"] = item.get_type() == Variant::OBJECT ? to_wire(item) : retain_value(item); encoded = entry;
 			} else encoded = item.get_type() == Variant::OBJECT ? to_wire(item) : retain_value(item);
+			encoded_bytes = Performance::json(encoded).utf8().length();
 		}
-		items.push_back(encoded);
-		if (!field_name.is_empty()) named[field_name] = encoded;
-		result[dictionary ? "entries" : fields.empty() ? "items" : "fields"] = fields.empty() ? Variant(items) : Variant(named);
-		if (JSON::stringify(result).utf8().length() > ValueCodec::INLINE_BYTES - 256) {
-			items.pop_back(); if (!field_name.is_empty()) named.erase(field_name);
+		int64_t addition = encoded_bytes + (count ? 1 : 0);
+		if (!field_name.is_empty()) addition += Performance::json(field_name).utf8().length() + 1;
+		if (prefix_bytes + addition > ValueCodec::INLINE_BYTES - 256) {
 			rollback_values(checkpoint);
 			if (count == 0) ValueCodec::fail("OUTPUT_LIMIT", "element cannot fit in a bounded page", "reference");
 			break;
 		}
+		items.push_back(encoded);
+		if (!field_name.is_empty()) named[field_name] = encoded;
+		prefix_bytes += addition;
 		count++;
+		Performance::add(PerfMetric::PAGE_ITEMS);
 		if (dictionary) more = value.iter_next(cursor, valid);
 	}
-	result[dictionary ? "entries" : fields.empty() ? "items" : "fields"] = fields.empty() ? Variant(items) : Variant(named);
+	result[page_key] = fields.empty() ? Variant(items) : Variant(named);
 	result["count"] = count;
 	result["next_offset"] = offset + count < size ? Variant(offset + count) : Variant();
 	result["truncated"] = offset + count < size;
+	if (Performance::json(result).utf8().length() > ValueCodec::INLINE_BYTES) ValueCodec::fail("OUTPUT_LIMIT", "page exceeds encoded byte limit", "reference");
 	return op_value(result);
 }
 
@@ -333,6 +368,7 @@ BridgeResult Bridge::encoded_result(const Variant &value, bool dispatched) {
 }
 
 Array Bridge::converted_args(const BridgeOp &op, Object *target) {
+	PerfScope cost(PerfMetric::CONVERSION_NS);
 	String kind = op.kind.c_str();
 	if (kind == "batch" || kind.begins_with("value_")) return op.args;
 	Dictionary signature;
@@ -416,12 +452,7 @@ static Variant unwrap_arg(const std::unordered_map<uint64_t, ObjectID> &handles,
 static bool member_authorized(ApiIndex *index, Object *obj, const String &member, bool property = false) {
 	if (!index || !obj || !index->class_allowed(obj->get_class())) return false;
 	for (const String &cls : {String(obj->get_class()), index->script_class(obj)}) {
-		if (!index->class_allowed(cls)) continue;
-		Dictionary entry = index->describe(cls);
-		Array members = entry.get(property ? "properties" : "methods", Array());
-		for (const Variant &item : members) {
-			if (String(((Dictionary)item).get("name", "")) == member) return true;
-		}
+		if (index->class_allowed(cls) && !index->member_info(cls, member, property).is_empty()) return true;
 	}
 	return false;
 }
@@ -647,6 +678,7 @@ BridgeResult Bridge::execute_op(const BridgeOp &incoming, const std::shared_ptr<
 		if (target) index->observe_script(target);
 		index->refresh();
 	}
+	PerfScope validation_cost(PerfMetric::VALIDATION_NS);
 	if ((kind == "get" || kind == "set" || (kind == "call" && op.class_name.empty())) && !target) return op_error("INVALID_HANDLE", "handle expired or unknown");
 	if (target && (kind == "get" || kind == "set" || kind == "call") && !member_authorized(index, target, op.member.c_str(), kind != "call")) return op_error("PERMISSION", member_denied_msg(index, target, kind, op.member.c_str()));
 	if (kind == "call" && !op.class_name.empty() && (!index || !index->member_allowed(op.class_name.c_str(), op.member.c_str()))) return op_error("PERMISSION", "static member not allowed or class tier locked");
@@ -673,6 +705,7 @@ BridgeResult Bridge::execute_op(const BridgeOp &incoming, const std::shared_ptr<
 	}
 	String effect_class = target ? String(target->get_class()) : String(op.class_name.c_str());
 	if (op.write && kind != "unlock_writes" && write_locked.load()) return op_error("TX_LOCKED", "writes locked pending review");
+	validation_cost.stop();
 	BridgeResult result;
 	uint64_t checkpoint = next_value;
 	try {
@@ -683,6 +716,7 @@ BridgeResult Bridge::execute_op(const BridgeOp &incoming, const std::shared_ptr<
 		result = op_error(failure.diagnostic["code"], failure.diagnostic["message"]);
 		result.error_context = failure.diagnostic;
 	}
+	if (index && op.write && kind != "value_release" && (result.ok || result.dispatched)) index->refresh(true);
 	if (!result.ok) {
 		result.error_context["operation"] = kind;
 		result.error_context["class"] = effect_class;
@@ -900,6 +934,7 @@ BridgeResult Bridge::dispatch_op(const BridgeOp &op, const std::shared_ptr<TxSta
 			if (!result.ok) return result;
 			created = result.value;
 		} else {
+			PerfScope native_cost(PerfMetric::NATIVE_NS);
 			created = cdb->instantiate(cls);
 		}
 		Object *obj = created.get_type() == Variant::OBJECT
@@ -995,7 +1030,9 @@ BridgeResult Bridge::dispatch_op(const BridgeOp &op, const std::shared_ptr<TxSta
 		if (!member_authorized(index, target, prop, true)) {
 			return op_error("PERMISSION", member_denied_msg(index, target, "property", prop));
 		}
+		PerfScope native_cost(PerfMetric::NATIVE_NS);
 		Variant v = target->get(prop);
+		native_cost.stop();
 		return encoded_result(v);
 	}
 
@@ -1006,8 +1043,10 @@ BridgeResult Bridge::dispatch_op(const BridgeOp &op, const std::shared_ptr<TxSta
 		}
 		Variant arg = op.args.size() > 0 ? op.args[0] : Variant();
 		uint64_t oid = (uint64_t)target->get_instance_id();
+		PerfScope native_cost(PerfMetric::NATIVE_NS);
 		Variant prior = target->get(prop);
 		target->set(prop, arg);
+		native_cost.stop();
 		Dictionary f = simple_op("set", oid), i = simple_op("set", oid);
 		f["prop"] = prop; f["val"] = arg;
 		i["prop"] = prop; i["val"] = prior;
@@ -1155,6 +1194,7 @@ void Bridge::drain(double budget_ms) {
 			inflight[pb->op.id] = pb;
 		}
 
+		if (pb->queued_ns) Performance::add(PerfMetric::QUEUE_WAIT_NS, Performance::now() - pb->queued_ns);
 		if (pb->cancel && pb->cancel->load()) {
 			pb->result = op_error("CANCELLED", "operation cancelled");
 		} else if (pb->op.kind == "request_tier") {

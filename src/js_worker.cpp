@@ -18,6 +18,7 @@
 #include "api_index.hpp"
 #include "bridge.hpp"
 #include "value_codec.hpp"
+#include "performance.hpp"
 
 extern "C" {
 #include <quickjs.h>
@@ -76,6 +77,7 @@ Dictionary error_result(const String &code, const String &message, const String 
 }
 
 Dictionary bounded_response(Dictionary out) {
+	PerfScope cost(PerfMetric::FINAL_RESPONSE_NS);
 	for (const char *field : {"diagnostics", "effects", "changes"}) {
 		Array records = Array(out.get(field, Array())).duplicate();
 		for (int i = 0; i < records.size(); i++) {
@@ -94,7 +96,7 @@ Dictionary bounded_response(Dictionary out) {
 		}
 		out[field] = records;
 	}
-	auto fits = [&]() { return JSON::stringify(out).utf8().length() <= OUTPUT_LIMIT; };
+	auto fits = [&]() { return Performance::json(out).utf8().length() <= OUTPUT_LIMIT; };
 	if (fits()) return out;
 	out["truncated"] = true;
 	if (out.get("result", Variant()).get_type() != Variant::NIL) {
@@ -283,6 +285,7 @@ struct DataBudget {
 	std::vector<JSValueConst> ancestors;
 	size_t bytes = 0;
 	int nodes = 0;
+	bool has_float = false;
 };
 
 String primitive_string(JSContext *ctx, JSValueConst value, String path = "value") {
@@ -300,6 +303,7 @@ String primitive_string(JSContext *ctx, JSValueConst value, String path = "value
 }
 
 Variant passive_data(JSContext *ctx, JSValueConst value, DataBudget &budget, String path, int depth = 0, bool allow_void = false) {
+	PerfScope cost(PerfMetric::JS_DECODE_NS, depth == 0);
 	if (depth > ValueCodec::MAX_DEPTH || ++budget.nodes > 100000 || (budget.bytes += 16) > HEAP_LIMIT) ValueCodec::fail("VALUE_DEPTH_LIMIT", "data depth, count or byte budget exceeded", path);
 	if (JS_IsUndefined(value)) {
 		if (allow_void) return Variant();
@@ -315,6 +319,7 @@ Variant passive_data(JSContext *ctx, JSValueConst value, DataBudget &budget, Str
 	}
 	if (JS_IsNumber(value)) {
 		if (JS_VALUE_GET_TAG(value) == JS_TAG_INT) return (int64_t)JS_VALUE_GET_INT(value);
+		budget.has_float = true;
 		return ValueCodec().encode(JS_VALUE_GET_FLOAT64(value), path);
 	}
 	if (JS_IsString(value)) {
@@ -378,17 +383,31 @@ Variant js_to_variant(JSContext *ctx, JSValueConst v) {
 	return passive_data(ctx, v, budget, "value");
 }
 
-JSValue passive_json(JSContext *ctx, JSValueConst value) {
+Variant parsed_json_numbers(Variant data) {
+	if (data.get_type() == Variant::INT) return (double)(int64_t)data;
+	if (data.get_type() == Variant::ARRAY) {
+		Array items = data;
+		for (int i = 0; i < items.size(); i++) items[i] = parsed_json_numbers(items[i]);
+	} else if (data.get_type() == Variant::DICTIONARY) {
+		Dictionary record = data;
+		for (const Variant &key : record.keys()) record[key] = parsed_json_numbers(record[key]);
+	}
+	return data;
+}
+
+String passive_json(JSContext *ctx, JSValueConst value, Variant &data, bool &reusable) {
 	try {
 		DataBudget budget;
-		Variant data = passive_data(ctx, value, budget, "result", 0, true);
-		String text = JSON::stringify(data);
-		CharString bytes = text.utf8();
-		if (bytes.length() > OUTPUT_LIMIT) ValueCodec::fail("OUTPUT_LIMIT", "encoded result exceeds output budget", "result");
-		return JS_NewStringLen(ctx, bytes.get_data(), bytes.length());
+		data = passive_data(ctx, value, budget, "result", 0, true);
+		String text = Performance::json(data);
+		if (text.utf8().length() > OUTPUT_LIMIT) ValueCodec::fail("OUTPUT_LIMIT", "encoded result exceeds output budget", "result");
+		reusable = !budget.has_float;
+		Performance::add(reusable ? PerfMetric::WORKER_RESULT_REUSE : PerfMetric::WORKER_RESULT_PARSE);
+		if (reusable) data = parsed_json_numbers(data);
+		return text;
 	} catch (const ValueFailure &failure) {
 		exec_ctx(ctx)->encoding_error = failure.diagnostic;
-		return JS_NewString(ctx, "null");
+		return "null";
 	}
 }
 
@@ -658,7 +677,7 @@ JSValue js_checkpoint(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv
 		throw;
 	}
 	Dictionary entry; entry["name"] = name; entry["value"] = data;
-	size_t encoded_bytes = JSON::stringify(entry).utf8().length() + (ec->checkpoints.is_empty() ? 0 : 1);
+	size_t encoded_bytes = Performance::json(entry).utf8().length() + (ec->checkpoints.is_empty() ? 0 : 1);
 	if (encoded_bytes > (64u << 10) - ec->checkpoint_bytes) ValueCodec::fail("CHECKPOINT_LIMIT", "checkpoint byte budget exceeded", "checkpoint.value");
 	ec->checkpoints.push_back(entry);
 	ec->checkpoint_bytes += encoded_bytes;
@@ -978,6 +997,9 @@ void JsWorker::run() {
 }
 
 Dictionary JsWorker::execute_one(const ExecRequest &req) {
+	PerfReport profile(req.search_only ? "search" : "execute");
+	PerfScope request_cost(PerfMetric::REQUEST_NS);
+	PerfScope context_cost(PerfMetric::CONTEXT_NS);
 	if (req.mode != "read" && req.mode != "write" && req.mode != "untracked") return error_result("INVALID_MODE", "mode must be read, write or untracked", "validate");
 	ExecBudget budget;
 	int64_t timeout_ms = req.timeout_ms;
@@ -1082,6 +1104,7 @@ Dictionary JsWorker::execute_one(const ExecRequest &req) {
 		JS_SetPropertyStr(ctx, global, "godot", godot_obj);
 	}
 
+	context_cost.stop();
 	// User code becomes the body of an async function; awaiting = async by design.
 	std::string wrapped = "(async () => {\n" + req.code + "\n})()";
 	JSValue val = JS_Eval(ctx, wrapped.c_str(), wrapped.size(), "<execute>", JS_EVAL_TYPE_GLOBAL);
@@ -1151,24 +1174,22 @@ Dictionary JsWorker::execute_one(const ExecRequest &req) {
 			out = error_result("CANCELLED", "execution cancelled", "execute");
 		} else if (st == JS_PROMISE_FULFILLED) {
 			JSValue r = JS_PromiseResult(ctx, val);
-			JSValue json = passive_json(ctx, r);
-			const char *s = JS_ToCString(ctx, json);
-			String text = s ? String::utf8(s) : String();
-			if (s) {
-				JS_FreeCString(ctx, s);
-			}
+			Variant data;
+			bool reusable = false;
+			String text = passive_json(ctx, r, data, reusable);
 			out = base_result(true);
 			if (text.length() > (int)OUTPUT_LIMIT) {
 				// Spec: bounded prefix + truncated flag — a truncated blob
 				// won't re-parse, so report it as a string.
 				out["result"] = text.substr(0, OUTPUT_LIMIT);
 				out["truncated"] = true;
+			} else if (reusable) {
+				out["result"] = data;
 			} else {
 				Ref<JSON> j;
 				j.instantiate();
 				out["result"] = (text.is_empty() || j->parse(text) != OK) ? Variant() : j->get_data();
 			}
-			JS_FreeValue(ctx, json);
 			JS_FreeValue(ctx, r);
 		} else if (st == JS_PROMISE_REJECTED) {
 			JSValue r = JS_PromiseResult(ctx, val);
@@ -1182,22 +1203,20 @@ Dictionary JsWorker::execute_one(const ExecRequest &req) {
 		}
 	} else {
 		// Non-promise value: user code didn't await anything; still a result.
-		JSValue json = passive_json(ctx, val);
-		const char *s = JS_ToCString(ctx, json);
-		String text = s ? String::utf8(s) : String();
-		if (s) {
-			JS_FreeCString(ctx, s);
-		}
+		Variant data;
+		bool reusable = false;
+		String text = passive_json(ctx, val, data, reusable);
 		out = base_result(true);
 		if (text.length() > (int)OUTPUT_LIMIT) {
 			out["result"] = text.substr(0, OUTPUT_LIMIT);
 			out["truncated"] = true;
+		} else if (reusable) {
+			out["result"] = data;
 		} else {
 			Ref<JSON> j;
 			j.instantiate();
 			out["result"] = (text.is_empty() || j->parse(text) != OK) ? Variant() : j->get_data();
 		}
-		JS_FreeValue(ctx, json);
 	}
 	JS_FreeValue(ctx, val);
 	JS_FreeValue(ctx, global);

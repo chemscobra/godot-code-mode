@@ -18,7 +18,8 @@ protected:
 	godot::Dictionary index; // class_name -> {inherits, methods[], properties[]}
 
 public:
-	explicit ApiCatalog(const godot::Dictionary &data = godot::Dictionary()) : index(data) {}
+	explicit ApiCatalog(const godot::Dictionary &data = godot::Dictionary());
+	~ApiCatalog();
 	godot::Array classes() const;                       // [{name, inherits}]
 	godot::Variant describe(const godot::String &name) const; // filtered detail or nil
 	godot::Array find(const godot::String &query) const;      // name substring matches
@@ -27,6 +28,12 @@ public:
 class ApiIndex : public ApiCatalog {
 	godot::Dictionary policy_document;
 	godot::Dictionary observed_scripts;
+	godot::Dictionary script_descriptors;
+	godot::Array native_descriptors;
+	godot::Variant cached_native_names, cached_singletons, cached_scripts;
+	godot::Dictionary method_descriptors, property_descriptors;
+	bool native_dirty = true;
+	godot::Dictionary inspect_script(godot::Object *script);
 	uint64_t revision = 0;
 	mutable std::mutex catalog_mutex;
 	std::shared_ptr<const ApiCatalog> catalog;
@@ -40,9 +47,9 @@ class ApiIndex : public ApiCatalog {
 public:
 	bool load(const godot::String &allowlist_path);
 	bool is_loaded() const { return loaded; }
-	bool refresh();
-	void invalidate() { dirty = true; }
-	void observe_script(godot::Object *object);
+	bool refresh(bool reconcile = false);
+	void invalidate(bool native = true);
+	void observe_script(godot::Object *object, bool inspect = true);
 	std::shared_ptr<const ApiCatalog> snapshot() const;
 	bool method_is_const(const godot::String &class_name, const godot::String &method) const;
 	godot::Dictionary member_info(const godot::String &class_name, const godot::String &member, bool property = false) const;
